@@ -255,11 +255,13 @@ class ResumeTests(unittest.TestCase):
             for flag, value, message in (("--epochs", 3, "train_args"), ("--accum", 3, "train_args"),
                                          ("--max_steps", 2, "train_args"), ("--hidden_size", 64, "config")):
                 self.launch(stage, f"{stage}_{flag[2:]}", ["--resume", good, flag, value], message)
-            for change, message in (("old", "resume"), ("stage", "stage"), ("cursor", "cursor"),
+            for change, message in (("old", "resume"), ("format", "resume"), ("stage", "stage"), ("cursor", "cursor"),
                                     ("fingerprints", "fingerprints"), ("rng", "resume")):
                 damaged = self.torch.load(good, map_location="cpu", weights_only=True)
                 if change == "old":
                     damaged = {k: damaged[k] for k in ("model", "optimizer", "step")}
+                elif change == "format":
+                    damaged["format"] = 2
                 elif change == "stage":
                     damaged["meta"]["stage"] = "other"
                 elif change == "cursor":

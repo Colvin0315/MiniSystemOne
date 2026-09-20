@@ -319,7 +319,7 @@ def bench(args):
     step = dict(input_ids=batch["input_ids"], seg_id=batch["seg_id"], cand_id=batch["cand_id"],
                 cand_span=batch["cand_span"], cand_mask=batch["cand_mask"],
                 prefix_mask=batch["prefix_mask"], attention_mask=attn,
-                target=batch["target"], is_ord=batch["is_ord"])
+                target=batch["target"], is_ord=batch["is_ord"], level_idx=batch["level_idx"])
 
     for _ in range(3):                                  # 预热
         with torch.autocast(dev.type, dtype=dtype, enabled=(dev.type == "cuda")):

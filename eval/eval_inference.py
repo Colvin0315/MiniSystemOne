@@ -141,7 +141,7 @@ def collect(model, dataset, device, batch_size=32, limit=0):
         "p": _pad_stack(P, 0.0, np.float64),
         "target": _pad_stack(T, 0.0, np.float64),
         "mask": _pad_stack(M, False, bool),
-        "levels": _pad_stack(LV, -1, np.int64),
+        "levels": _pad_stack(LV, -1, np.float64),
         "is_ord": np.concatenate(IO),
         "primitive": primitives,
         "n": n,

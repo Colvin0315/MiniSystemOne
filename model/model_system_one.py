@@ -423,7 +423,7 @@ class MiniSystemOneForDecision(PreTrainedModel):
                 prefix_mask=None, attention_mask=None, position_ids=None,
                 past_key_values=None, use_cache=False,
                 target=None, is_ord=None, lambda_brier=0.5, lambda_ord=0.5,
-                brier_normalize=False, **kwargs):
+                level_idx=None, brier_normalize=False, **kwargs):
         if seg_id is not None:
             # mask 与 prefix_mask 一律从 seg_id / cand_id 推出，不要求调用方传。
             # 除了省一次 (B,1,S,S) 的搬运，更重要的是**漏传时不会静默退化成全连通
@@ -449,7 +449,7 @@ class MiniSystemOneForDecision(PreTrainedModel):
         if target is not None:
             loss, loss_dict = self.compute_loss(logits, target, cand_mask, is_ord,
                                                 lambda_brier, lambda_ord,
-                                                brier_normalize=brier_normalize)
+                                                brier_normalize, level_idx)
         return DecisionOutput(
             loss=loss, logits=logits, z=z, hidden_states=hidden,
             past_key_values=presents, loss_dict=loss_dict,
@@ -457,7 +457,8 @@ class MiniSystemOneForDecision(PreTrainedModel):
 
     @staticmethod
     def compute_loss(logits, target, cand_mask, is_ord=None,
-                     lambda_brier=0.5, lambda_ord=0.5, brier_normalize=False):
+                     lambda_brier=0.5, lambda_ord=0.5, brier_normalize=False,
+                     level_idx=None):
         """L = CE + lambda_b * Brier + is_ord * lambda_o * CDF-MSE。全部在 fp32 上算。"""
         logits = logits.float()
         # 屏蔽槽位置为 NEG_INF，softmax 后为 0，因此它们在各项中贡献 0
@@ -475,10 +476,25 @@ class MiniSystemOneForDecision(PreTrainedModel):
         loss_dict = {"ce": loss_ce.detach(), "brier": loss_brier.detach()}
 
         if is_ord is not None and lambda_ord > 0 and is_ord.sum() > 0:
-            cdf_p = p.cumsum(-1)[..., :-1]
-            cdf_t = t.cumsum(-1)[..., :-1]
-            per_item = ((cdf_p - cdf_t) ** 2).mean(-1)
-            loss_ord = (per_item * is_ord.float()).sum() / is_ord.float().sum().clamp(min=1)
+            if level_idx is None:
+                raise ValueError("Score loss requires level_idx in candidate presentation order")
+            sel = is_ord.bool()
+            valid = cand_mask[sel]
+            levels = level_idx[sel].float()
+            if not torch.isfinite(levels[valid]).all() or (levels[valid] < 0).any():
+                raise ValueError("Score candidates require finite nonnegative levels")
+            order = levels.masked_fill(~valid, float('inf')).argsort(-1)
+            lv = levels.gather(1, order)
+            vm = valid.gather(1, order)
+            gaps = lv[:, 1:] - lv[:, :-1]
+            edges = vm[:, 1:] & vm[:, :-1]
+            if (valid.sum(-1) < 2).any() or (gaps[edges] <= 0).any():
+                raise ValueError("Score requires at least two distinct levels")
+            # Integrate squared CDF error along the ordered grade axis. Padding
+            # has no edges; normalize by each sample's own grade range.
+            gaps = torch.where(edges, gaps, torch.zeros_like(gaps))
+            delta = (p[sel].gather(1, order) - t[sel].gather(1, order)).cumsum(-1)[:, :-1]
+            loss_ord = ((delta.square() * gaps).sum(-1) / gaps.sum(-1)).mean()
             loss = loss + lambda_ord * loss_ord
             loss_dict["ord"] = loss_ord.detach()
 

@@ -36,6 +36,20 @@ expected_brier = distribution_l2 + mean_i (1 - sum_k t_ik^2)
 保留原名；所训练的平方项是 distribution L2。默认不除以 K；显式归一化时每条除以
 有效候选数（无 mask 时为 K），再跨样本平均。模型 forward 显式传递该开关。
 
+### Score 的序数损失与距离指标
+
+先剔除 padding，再按候选真实 `meta.level` 排序为 $l_1<\cdots<l_K$，同步排列 p、t，令 $F_p(j)=\sum_{i\le j}p_i$。训练与评测使用不同的量：
+
+$$
+\mathcal L_{\mathrm{ord}}=\frac{\sum_{j=1}^{K-1}(l_{j+1}-l_j)[F_p(j)-F_t(j)]^2}{l_K-l_1}
+$$
+
+$$
+\mathrm{ordinal\_mae}=\operatorname{mean}_{\mathrm{Score}}\sum_{j=1}^{K-1}(l_{j+1}-l_j)\lvert F_p(j)-F_t(j)\rvert
+$$
+
+前者是按级差加权、除以等级跨度的 CDF 平方误差；后者是等级单位的 Wasserstein-1 距离，不乘 0.5，也不除以等级跨度。`expected_score_mae` 则是 $\lvert\sum_i l_i p_i-\sum_i l_i t_i\rvert$ 的 Score 样本均值，不等于整个分布的距离。
+
 ### 输出键迁移（没有兼容别名）
 
 | 旧输出/函数 | 新契约 |

@@ -264,15 +264,27 @@ def expected_score(p, levels, mask=None):
 
 
 def ordinal_mae(p, t, levels=None, mask=None):
-    """0.5 · Σ|CDF_p − CDF_t| —— CDF 形式对序数距离更敏感（方案指定）。
+    """Wasserstein-1 distance in grade units (MAE for point distributions).
 
-    levels 只用于给出 MAE 的量纲（等级数）；纯 CDF 版本不需要它。
+    Sort by explicit levels, not presentation order. If omitted, columns are
+    assumed to already be consecutive increasing levels. Historical versions
+    ignored levels and multiplied by 0.5; those results are not comparable.
     """
     p = mask_normalize(p, mask)
     t = mask_normalize(t, mask)
-    cdf_p = np.cumsum(p, -1)[..., :-1]
-    cdf_t = np.cumsum(t, -1)[..., :-1]
-    return float((0.5 * np.abs(cdf_p - cdf_t).sum(-1)).mean())
+    valid = np.ones_like(p, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    lv = np.broadcast_to(np.arange(p.shape[-1]) if levels is None else np.asarray(levels), p.shape)
+    if not np.isfinite(lv[valid]).all():
+        raise ValueError("Score levels must be finite")
+    order = np.argsort(np.where(valid, lv, np.inf), axis=-1)
+    sorted_lv = np.take_along_axis(lv, order, -1)
+    sorted_mask = np.take_along_axis(valid, order, -1)
+    edges = sorted_mask[:, :-1] & sorted_mask[:, 1:]
+    gaps = np.diff(sorted_lv, axis=-1)
+    if np.any(valid.sum(-1) < 2) or np.any(gaps[edges] <= 0):
+        raise ValueError("Score requires at least two distinct levels")
+    delta = np.cumsum(np.take_along_axis(p - t, order, -1), -1)[:, :-1]
+    return float((np.abs(delta) * np.where(edges, gaps, 0)).sum(-1).mean())
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +348,8 @@ def compute_metrics(p, t, mask=None, provenance=None, is_ord=None, levels=None,
         out["ece_annotation_reference_n"] = int((np.isfinite(c) & (c > 0)).sum())
     if is_ord is not None and np.any(is_ord):
         sel = np.asarray(is_ord, dtype=bool)
-        out["ordinal_mae"] = ordinal_mae(p[sel], t[sel], levels, None if mask is None else mask[sel])
+        ord_levels = levels[sel] if levels is not None and np.ndim(levels) == 2 else levels
+        out["ordinal_mae"] = ordinal_mae(p[sel], t[sel], ord_levels, None if mask is None else mask[sel])
         if levels is not None:
             es_p = expected_score(p[sel], levels[sel] if np.ndim(levels) == 2 else levels, mask[sel] if mask is not None else None)
             es_t = (mask_normalize(t[sel], None if mask is None else mask[sel])

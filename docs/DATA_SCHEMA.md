@@ -40,7 +40,7 @@
 | `id` | `<generator>::<split>::<序号>`，全局唯一 |
 | `source` | `synth:<生成器名>` 或 `public:<适配器名>` |
 | `gen_version` | 语义化版本。**测试集只用冻结版本重生成**，版本号写进每个结果 JSON |
-| `split` | `train` / `val` / `calib` / `test_known` / `test_ood` |
+| `split` | 每行必填，且必须与所在文件匹配：`train` / `val` / `calib` / `test_known` / `test_ood`（例如 `train.jsonl` 中必须为 `train`）；缺失或不匹配会报错 |
 | `schema.primitive` | `noul` / `choice` / `score`。**三者共用一份 forward 与一份 loss**，差别只在这里与 `is_ord` |
 | `schema.positive_label` | 仅 `noul` 用。**正向标签由它指定，绝不按下标** —— 否则候选打乱后 `p_yes` 语义会翻转 |
 | `state` | 渲染后的自然语言，模型实际读到的就是它 |
@@ -50,7 +50,7 @@
 | `question_paraphrases` | ≥3 条复述。**不参与训练**；本仓库目前没有任何脚本消费它（原本供一套复述扰动评测用，该评测未产出） |
 | `candidates[].text` | 候选文本，顺序即呈现顺序。生成器与适配器**必须逐例重排** |
 | `candidates[].label` | 候选的稳定标识，用于正确性判定与 target 对齐 |
-| `candidates[].meta.level` | 仅 `score` 用，1–5 的序数等级 |
+| `candidates[].meta.level` | 每个 `score` 候选必填真实数值等级，例如 1–5；不按候选下标推断。损失与距离先剔除 padding，再按该值排序并使用实际级差 |
 | `target.kind` | `soft`（有完整分布）或 `hard`（one-hot，`p` 退化为 0/1） |
 | `target.p` | 长度 = `len(candidates)`，**和为 1**。若是子采样后的目标，须重新归一化 |
 | `target.provenance` | `explicit_rng` / `marginalized` / `tie_set` / `human_annotators` / `hard` |
@@ -66,8 +66,8 @@
 
 `target.provenance` 说明目标构造来源，用于分组解释，不决定校准资格。
 硬标签 CE/观测 Brier 是 proper scores，硬标签也能计算 ECE。混合总体合法但须说明组成。
-新输出使用 `all`、各 provenance、必要时的 `soft_targets` 聚合（旧名 `calibration`）。
-`distribution_l2` 替代旧指标 `brier`，新增 `expected_brier`，详见 [CALIBRATION.md](CALIBRATION.md)。
+新输出使用 `all`、各 provenance、必要时的 `soft_targets` 聚合（上述非 `hard` 来源；与 `all` 重合时不重复输出）。
+评测字段为 `distribution_l2` 和 `expected_brier`；旧 `brier` 指标和 `calibration` 聚合均无兼容别名，详见 [CALIBRATION.md](CALIBRATION.md)。
 
 | provenance | 含义 | 来源 | 校准指标 |
 |---|---|---|---|

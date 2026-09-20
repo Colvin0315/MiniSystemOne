@@ -234,7 +234,8 @@ def init_model(model_cls, config, checkpoint=None, device="cuda", strict=False):
     return model.to(device)
 
 
-RESUME_FORMAT = 2
+# Exact resume requires the level-sorted, gap-weighted ordinal objective.
+RESUME_FORMAT = 3
 
 
 def seed_training(seed, device):

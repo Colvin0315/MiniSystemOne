@@ -231,7 +231,7 @@ def main():
                 out = model(
                     batch["input_ids"], seg_id=batch["seg_id"], cand_id=batch["cand_id"],
                     cand_span=batch["cand_span"], cand_mask=batch["cand_mask"],
-                    target=batch["target"], is_ord=batch["is_ord"],
+                    target=batch["target"], is_ord=batch["is_ord"], level_idx=batch["level_idx"],
                     lambda_brier=args.lambda_brier, lambda_ord=args.lambda_ord,
                     brier_normalize=args.brier_normalize,
                 )

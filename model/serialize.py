@@ -225,7 +225,7 @@ def collate_packed(examples, pad_id, sep_id, dtype=torch.float32, device=None):
     cand_span = torch.full((bsz, max_k, 2), -1, dtype=torch.long)
     cand_mask = torch.zeros((bsz, max_k), dtype=torch.bool)
     target = torch.zeros((bsz, max_k), dtype=torch.float32)
-    level_idx = torch.full((bsz, max_k), -1, dtype=torch.long)
+    level_idx = torch.full((bsz, max_k), -1, dtype=torch.float32)
     is_ord = torch.zeros(bsz, dtype=torch.float32)
 
     for i, e in enumerate(examples):
@@ -240,7 +240,7 @@ def collate_packed(examples, pad_id, sep_id, dtype=torch.float32, device=None):
         if "target" in e:
             target[i, :k] = torch.tensor(e["target"], dtype=torch.float32)
         if "levels" in e:
-            level_idx[i, :k] = torch.tensor(e["levels"], dtype=torch.long)
+            level_idx[i, :k] = torch.tensor(e["levels"], dtype=torch.float32)
         is_ord[i] = 1.0 if e.get("primitive") == "score" else 0.0
 
     batch = {

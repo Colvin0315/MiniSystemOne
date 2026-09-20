@@ -187,7 +187,8 @@ attend 过 state，`H[question_positions]` 里已经含有"问题条件下的 st
 ## 6. Loss
 
 ```
-L = CE(t, p) + λ_b · sum_k (p_k-t_k)^2 + is_ord · λ_o · CDF-MSE(t, p)
+L = mean_B CE(t, p) + λ_b · mean_B sum_k (p_k-t_k)^2
+    + λ_o · mean_Score L_ord(t, p)  # 无 Score 样本时省略最后一项
 ```
 
 - **λ_b = 0.5，作用于全部样本。** 平方项是 distribution L2，逐条对类别求和再取样本均值。
@@ -201,10 +202,15 @@ L = CE(t, p) + λ_b · sum_k (p_k-t_k)^2 + is_ord · λ_o · CDF-MSE(t, p)
   `distribution_l2` 和 `expected_brier`，无旧指标别名。
 
 - **λ_o = 0.5，仅 Score 样本。**
-  `mse_loss(p.cumsum(-1)[...,:-1], target.cumsum(-1)[...,:-1])`。
-  softmax 不知道 5 > 1，这一项知道。直接改善 `expected_score = Σ level_k · p_k`，
-  而 Score 的头号输出取决于**整个分布的形状**而非 argmax。
-  由 per-sample 的 `is_ord: (B,)` 门控，使 Score 与非 Score 样本可同 batch。
+  先按 `cand_mask` 剔除 padding，再按真实 `meta.level` 排序为 `l_1 < ... < l_K`，
+  同步重排 p、t。令 `F_p(j) = sum_{i<=j} p_i`，则
+  `L_ord = sum_{j=1}^{K-1} (l_{j+1}-l_j) * (F_p(j)-F_t(j))^2 / (l_K-l_1)`。
+  这是级差加权并按等级跨度归一化的 CDF 平方误差，不是按呈现顺序直接做 `mse_loss`。
+  softmax 本身不知道 5 > 1；序数项使用真实等级距离，监督整个分布而非只监督 argmax
+  或 `expected_score = Σ level_k · p_k`。按 `is_ord: (B,)` 选出 Score 后单独取均值，
+  不稀释到整个 batch；无 Score 时省略此项。
+  评测 `ordinal_mae` 是 `sum_j (l_{j+1}-l_j) * abs(F_p(j)-F_t(j))` 的 Score 样本均值，
+  即等级单位的 Wasserstein-1 距离，不乘 0.5，也不除以等级跨度。
 
 - **计算一律在 fp32**。bf16 下 Brier 与 CDF-MSE 的差值会被显著截断。
 
