@@ -1,0 +1,114 @@
+{
+  "gen_version": "1.0.0",
+  "seed": 0,
+  "tokenizer_sha1": "bf7a131a109e",
+  "generators": [
+    "banking_balance",
+    "tool_router",
+    "agent_trace_score",
+    "security_gate",
+    "refund_policy",
+    "calendar_slot"
+  ],
+  "ood_generators": [],
+  "max_len": 1024,
+  "counts": {
+    "train": 180000,
+    "val": 6000,
+    "calib": 6000,
+    "test_known": 18000,
+    "test_ood": 0
+  },
+  "tokens": {
+    "train": 38975872,
+    "val": 1318441,
+    "calib": 1314282,
+    "test_known": 3909970,
+    "test_ood": 0
+  },
+  "by_source": {
+    "train": {
+      "agent_trace_score": 30000,
+      "banking_balance": 30000,
+      "calendar_slot": 30000,
+      "refund_policy": 30000,
+      "security_gate": 30000,
+      "tool_router": 30000
+    },
+    "val": {
+      "agent_trace_score": 1000,
+      "banking_balance": 1000,
+      "calendar_slot": 1000,
+      "refund_policy": 1000,
+      "security_gate": 1000,
+      "tool_router": 1000
+    },
+    "calib": {
+      "agent_trace_score": 1000,
+      "banking_balance": 1000,
+      "calendar_slot": 1000,
+      "refund_policy": 1000,
+      "security_gate": 1000,
+      "tool_router": 1000
+    },
+    "test_known": {
+      "agent_trace_score": 3000,
+      "banking_balance": 3000,
+      "calendar_slot": 3000,
+      "refund_policy": 3000,
+      "security_gate": 3000,
+      "tool_router": 3000
+    },
+    "test_ood": {}
+  },
+  "by_provenance": {
+    "train": {
+      "explicit_rng": 74062,
+      "hard": 16376,
+      "marginalized": 60000,
+      "tie_set": 29562
+    },
+    "val": {
+      "explicit_rng": 2625,
+      "hard": 557,
+      "marginalized": 2000,
+      "tie_set": 818
+    },
+    "calib": {
+      "explicit_rng": 2625,
+      "hard": 569,
+      "marginalized": 2000,
+      "tie_set": 806
+    },
+    "test_known": {
+      "explicit_rng": 7500,
+      "hard": 1639,
+      "marginalized": 6000,
+      "tie_set": 2861
+    },
+    "test_ood": {}
+  },
+  "by_language": {
+    "train": {
+      "en": 62846,
+      "mix": 54328,
+      "zh": 62826
+    },
+    "val": {
+      "en": 2074,
+      "mix": 1792,
+      "zh": 2134
+    },
+    "calib": {
+      "en": 2098,
+      "mix": 1773,
+      "zh": 2129
+    },
+    "test_known": {
+      "en": 6352,
+      "mix": 5344,
+      "zh": 6304
+    },
+    "test_ood": {}
+  }
+}

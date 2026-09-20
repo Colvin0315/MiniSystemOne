@@ -1,0 +1,48 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- 训练产物（大、可重生成、不入库）----
+# 注意 assets/*.png **不**在这里 —— 可靠性图是旗舰产物，必须入库，
+# 否则 clone 之后 README 就没有图。
+out/
+*.pth
+*.pt
+*.safetensors
+*.tmp
+
+# ---- 数据集 ----
+# `manifest.json` 入库（记录 token 数、tokenizer sha1、各 split 条数，
+# 是复核数字的凭据），但 jsonl 本体太大且可由生成器完整重建。
+dataset/synth/*.jsonl
+# 冒烟集是**嵌套目录**，`dataset/synth/*.jsonl` 只匹配一层、盖不住它 ——
+# `build_dataset.py --smoke` 一跑，6 个 jsonl 就会进仓库。
+dataset/synth/smoke/
+dataset/synth_ood/*.jsonl
+dataset/public/*.jsonl
+# 预训练语料三份：合并件 + 两个来源件（alpaca 16 MB / wikitext 45 MB），
+# 全部由 `dataset/pretrain_corpus.py` 重新下载并拼装。**通配符必须收在
+# `pretrain_en*`** —— 只写 `pretrain_en.jsonl` 时两个来源件不被覆盖，
+# `git add .` 会把 61 MB 语料一起推上去。
+dataset/pretrain_en*.jsonl
+dataset/corpus_*.txt
+
+# ---- 分词器实验目录 ----
+# 调压缩率时留下的中间版本，最终词表在 model/。留着会让人分不清哪个是正式的。
+# `*.log` 也没忽略：日志属于 out/ 下，忽略全局 *.log 会顺手吃掉别的有用文件。
+model_tok_legacy/
+model_tok_v*/
+
+# ---- 编辑 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+swanlog/
+
+# ---- 本地工具配置 ----
+# `.claude/settings.local.json` 是**本机**的权限白名单（哪些命令免询问），
+# 对别人没有意义，且会把"我这台机器上跑过什么"带进公开仓库。
+.claude/

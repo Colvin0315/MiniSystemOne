@@ -1,0 +1,90 @@
+{
+  "gen_version": "1.0.0",
+  "seed": 0,
+  "tokenizer_sha1": "bf7a131a109e",
+  "adapters": [
+    "chaosnli",
+    "clinc150",
+    "banking77",
+    "goemotions",
+    "amazon_score"
+  ],
+  "max_len": 1024,
+  "limit": 0,
+  "counts": {
+    "train": 48299,
+    "val": 13151,
+    "calib": 7536,
+    "test_known": 29043,
+    "test_ood": 0
+  },
+  "tokens": {
+    "train": 7863312,
+    "val": 1602515,
+    "calib": 996668,
+    "test_known": 3715344,
+    "test_ood": 0
+  },
+  "by_source": {
+    "train": {
+      "banking77": 9035,
+      "chaosnli": 800,
+      "clinc150": 13721,
+      "goemotions": 24743
+    },
+    "val": {
+      "amazon_score": 5000,
+      "chaosnli": 176,
+      "clinc150": 3100,
+      "goemotions": 4875
+    },
+    "calib": {
+      "banking77": 968,
+      "chaosnli": 149,
+      "clinc150": 1529,
+      "goemotions": 4890
+    },
+    "test_known": {
+      "amazon_score": 5000,
+      "banking77": 3080,
+      "chaosnli": 474,
+      "clinc150": 5500,
+      "goemotions": 14989
+    },
+    "test_ood": {}
+  },
+  "by_provenance": {
+    "train": {
+      "hard": 22756,
+      "human_annotators": 25543
+    },
+    "val": {
+      "hard": 8100,
+      "human_annotators": 5051
+    },
+    "calib": {
+      "hard": 2497,
+      "human_annotators": 5039
+    },
+    "test_known": {
+      "hard": 13580,
+      "human_annotators": 15463
+    },
+    "test_ood": {}
+  },
+  "by_language": {
+    "train": {
+      "en": 48299
+    },
+    "val": {
+      "en": 13151
+    },
+    "calib": {
+      "en": 7536
+    },
+    "test_known": {
+      "en": 29043
+    },
+    "test_ood": {}
+  }
+}

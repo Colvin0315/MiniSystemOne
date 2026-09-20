@@ -1,0 +1,52 @@
+# MiniSystemOne 依赖
+#
+# 本项目**不做包安装**（没有 pyproject.toml / setup.py），沿用 MiniMind 的形状：
+# 脚本直接跑、内部 sys.path.append。所以这份清单只用来复现环境，不参与打包。
+#
+# 版本号是**实测跑通的组合**，不是从文档抄的下界。这一栏必须保留具体版本，
+# 因为下面两条已知的坑都只在特定版本区间成立：
+#
+# 1. **Windows 上 `datasets`(pyarrow) 必须在 `torch` 之前 import。**
+#    反过来会让进程在 `import torch` 处静默消失（退出码 139，零输出，无 traceback）。
+#    这是 DLL 加载顺序问题，不是版本冲突 —— 换 pyarrow 版本不解决，只能靠顺序，
+#    所以 `trainer/train_mlm.py` 里保留着 MiniMind 原样的 `import datasets  # noqa: F401`。
+# 2. **torch 的 SDPA 后端选择随版本变。** 本项目方案里的实测数字（float additive mask
+#    比 bool mask 更快更省显存、不要用 enable_gqa、不要用 GQA 推理路径）是在
+#    2.5.1+cu121 上测的；当前环境是 2.6.0+cu124。换 torch 版本后请用
+#    `scripts/smoke_test.py` + 一段 attention 微型基准重新确认，不要默认结论仍成立。
+#
+# 装法（conda 环境名沿用 minimind，与 MiniMind 参考实现共存）：
+#   conda create -n minimind python=3.12
+#   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124
+#   pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+
+# --- 核心 ---
+torch==2.6.0+cu124
+transformers==4.57.6
+tokenizers==0.22.2
+
+# --- 数据 ---
+# datasets 3.6.0 拉入 pyarrow 24.0.0。**这个 import 顺序问题是 Windows 特有的**，
+# 见上方第 1 条。公开数据集 adapter 全部走 datasets.load_dataset。
+datasets==3.6.0
+pyarrow==24.0.0
+huggingface-hub==0.36.2
+
+# --- 数值 / 指标 / 绘图 ---
+# numpy 2.x：transformers 4.57 要求 >=1.17 且实测在 2.5.3 上正常。
+#   ⚠ 2.x 与 1.x 的 ABI 不兼容 —— 若你环境里还有别的包卡在 numpy<2，
+#     请新建环境而不是降级 numpy，降级会连带 matplotlib/scikit-learn 重装。
+# matplotlib 只用于 make_reliability_plot.py，但**不是可选项**：
+#   可靠性图是本项目的旗舰产物，缺它就没法出图。
+numpy==2.5.3
+matplotlib==3.11.2
+scikit-learn>=1.5.1        # Bag-of-Words 门禁探针（audit_synthetic.py）
+
+# --- 日志（可选）---
+# swanlab 缺失时 Logger 会静默降级成"只写本地 train.log"，训练不受影响。
+# 另外：**非交互式运行（重定向 / 后台 / CI）时 Logger 会强制关掉 swanlab**，
+# 因为它首次运行会在 stdin 上弹三选一问卷并**阻塞等待**，后台跑起来像卡死。
+swanlab==0.7.11
+
+# --- 杂项 ---
+tqdm==4.68.4
