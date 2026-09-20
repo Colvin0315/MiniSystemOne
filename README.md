@@ -1,752 +1,572 @@
-# MiniSystemOne
+<div align="center">
 
-> **Train a probabilistic decision model from scratch — no LLM, no decoding, no JSON generation.**
+# 🚀 MiniSystemOne
 
-A ~27M-parameter model that takes a **state** plus **typed questions** and returns
-**typed decisions with calibrated probabilities** — in a single parallel forward pass.
-No autoregressive loop, no text output, no constrained-decoding tricks.
+### Build a small decision model from scratch on a consumer GPU
 
-Built from random initialization, MiniMind-style: one shared bidirectional encoder,
-one decision head, one loss. Every number in this README is reproducible from this
-repository on a single 8 GB laptop GPU.
+[中文](README_zh.md) | **English**
+
+⚡ [Quick start](#quick-start) · 🚀 [Your first task](#first-task) · 📚 [Datasets](#datasets) · 🛠️ [Training walkthrough](#training) · 📉 [Training losses](#loss) · 📊 [Evaluation](#evaluation)
+
+</div>
+
+![MiniSystemOne: consumer GPU, shared encoder, and six-stage learning path](assets/readme/overview.png)
 
 ---
 
-## What a "System One" model is
+## 🌱 Introduction
 
-On 2026-09-15 TypeSafe AI released **Jev**, the first "System One Model" — a model that
-does not generate text at all. You hand it a **state** (unstructured context) plus a set
-of **typed questions**, and it returns **typed decisions with probabilities**, computed in
-one parallel forward pass.
+Give a model some context, a question, and a set of candidates, and get a probability for each option. That is the model MiniSystemOne teaches you to build.
 
-Its published properties, from TypeSafe's own documentation:
+For example, a customer asks to check their balance. Your application must choose between a balance lookup, a transfer workflow, and human review. Beyond calling an API, we want to understand how text becomes tokens, how an encoder reads evidence, how candidates receive scores, how probabilities are learned, and how to check whether those probabilities are reliable.
 
-| Property | Detail |
+Inspired by the teaching approach of [MiniMind](https://github.com/jingyaogong/minimind), this project takes beginners from a new BPE vocabulary and a randomly initialized encoder through **data preparation → MLM pretraining → decision training → temperature calibration → evaluation → application integration**. The default decision model has approximately **26.89M parameters**, with training loops written directly in PyTorch.
+
+The model interface is inspired by Jev / System One. This is an independent educational implementation, not a reproduction of Jev's internal architecture or RLCD training method. Training is supervised and does not use Jev outputs as training data.
+
+### 🎓 What you will learn
+
+- Train a tokenizer and understand vocabulary, special tokens, and sequence packing.
+- Build a shared encoder that handles different decisions through candidate scoring.
+- Generate traceable target distributions and distinguish hard labels, soft targets, and human disagreement.
+- Read and modify MLM, cross-entropy, Brier, and ordinal losses.
+- Separate training, validation, calibration, held-out evaluation, and cross-task evaluation.
+- Train on your own task and use probabilities to route requests to automation or human review.
+
+### 🧩 Three question types, one model
+
+| Primitive | Example use | Output |
+|---|---|---|
+| **Noul** | Does this satisfy a condition or pass a check? | `P(yes)` and `P(no)` |
+| **Choice** | Which tool, intent, or action should be selected? | Distribution over 2–255 dynamic candidates |
+| **Score** | What rating or execution-quality level applies? | Distribution over 2–10 levels and an expected score |
+
+All three share one encoder and one candidate-scoring head. The model does not generate an answer token by token: the packed path scores candidates in parallel, while large candidate sets can be processed in chunks. Python assembles the output JSON.
+
+> **Current status:** the minimal training pipeline, inference interface, and regression tests have been exercised. Older weights and historical plots used the ordinal loss before its correction; updated full-model results require retraining, calibration, and evaluation. Old numbers are not presented as current results here. The repository does not include `.pth` weights; start by training the small model below.
+
+<a id="quick-start"></a>
+## ⚡ I · Quick start: run the complete pipeline
+
+### 1. Set up the environment
+
+Training requires an NVIDIA CUDA GPU. Inference and basic tests also support CPU. Historical runs used a single RTX 4070 Laptop GPU with 8GB VRAM, but memory use and speed depend on batch size, sequence length, and candidate count.
+
+```shell
+git clone https://github.com/Colvin0315/MiniSystemOne.git
+cd MiniSystemOne
+conda create -n minisystemone python=3.12 -y
+conda activate minisystemone
+python -m pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r requirements.txt
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+```
+
+Run every command from the repository root. Commands use single lines for PowerShell and Bash. Confirm CUDA is `True` before training. Full training defaults to `hidden_size=512` and `num_hidden_layers=8`; this quick start uses a smaller `128 × 2` model.
+
+### 2. Train a small model from scratch
+
+This route uses generated data only: no external corpus download or separate MiniMind checkout is needed. All artifacts go under `out/quickstart/`. Use a fresh output directory to avoid overwriting an existing run.
+
+**The purpose is to understand and verify the pipeline. A few training steps do not establish task competence.**
+
+**🔤 ① Train your tokenizer**
+
+```shell
+python trainer/train_tokenizer.py --pretrain_path= --en_path= --n_docs 0 --n_synth 200 --out_dir out/quickstart/tokenizer --skip_eval
+```
+
+This produces `tokenizer.json` and `tokenizer_config.json`. Empty `--pretrain_path=` and `--en_path=` explicitly disable those external corpora. `--skip_eval` skips the compression check for this tiny demonstration.
+
+**🧩 ② Generate decision data**
+
+```shell
+python scripts/build_dataset.py --tokenizer out/quickstart/tokenizer --out out/quickstart/data --per_gen_train 20 --per_gen_val 4 --per_gen_calib 4 --per_gen_test_known 4 --per_gen_test_ood 4
+```
+
+The six generators produce 120 training examples and 24 examples each for validation, calibration, and known-task testing. No entire generator is held out by default, so `test_ood` is empty. Setting `--per_gen_test_ood` alone does not create an OOD task.
+
+**🧠 ③ Pretrain text representations with MLM**
+
+```shell
+python trainer/train_mlm.py --tokenizer out/quickstart/tokenizer --pretrain_path= --en_path= --n_docs 0 --n_synth 40 --hidden_size 128 --num_hidden_layers 2 --max_len 256 --batch_size 2 --epochs 1 --max_steps 5 --save_optimizer --no_swanlab --out out/quickstart/mlm --log_dir out/quickstart/mlm/logs
+```
+
+**🎯 ④ Learn candidate probabilities**
+
+```shell
+python trainer/train_decision.py --tokenizer out/quickstart/tokenizer --data out/quickstart/data --encoder out/quickstart/mlm/mlm.pth --hidden_size 128 --num_hidden_layers 2 --batch_size 2 --epochs 1 --max_steps 5 --val_limit 12 --val_every 0 --save_optimizer --no_swanlab --out out/quickstart/decision --log_dir out/quickstart/decision/logs
+```
+
+**📊 ⑤ Calibrate and evaluate on separate data**
+
+```shell
+python trainer/calibrate_temperature.py --tokenizer out/quickstart/tokenizer --ckpt out/quickstart/decision/decision.pth --data out/quickstart/data --hidden_size 128 --num_hidden_layers 2 --batch_size 2 --lbfgs_steps 10 --out out/quickstart/calibration
+python eval/eval_harness.py --tokenizer out/quickstart/tokenizer --ckpt out/quickstart/decision/decision.pth --data out/quickstart/data --hidden_size 128 --num_hidden_layers 2 --batch_size 2 --sets test_known --out out/quickstart/eval
+```
+
+The second command reports uncalibrated results. Add `--temperature out/quickstart/calibration/T.json` to compare temperature-scaled results alongside them. This tiny calibration set is only a demonstration.
+
+**🚀 ⑥ Submit a question**
+
+```shell
+python scripts/decide.py --tokenizer out/quickstart/tokenizer --ckpt out/quickstart/decision/decision.pth --input examples/choice.json --device cpu
+```
+
+You have now followed the path from a vocabulary and random weights to a decision output. Inspect the artifacts to connect each stage with its code:
+
+| Path | Contents |
 |---|---|
-| **Three primitives** | `Noul` — P(true) for a yes/no question. `Choice` — a distribution over **2–255** dynamically supplied candidates. `Score` — a distribution over 2–10 ordered levels plus an expected score. |
-| **One call, many questions** | A 14-question rubric answered in a single request. Their `parallel_questions` cookbook measures one batched call as "**12.2× cheaper and 10.0× faster with no change in answers**". |
-| **No decoding** | No autoregressive loop and no JSON to parse, so there is no schema error to handle. |
-| **Reproducible** | Over 15 repeats of an identical request, mean per-question probability **σ = 0.0102** — in a setting where LLMs "move from run to run, at temperature 0 too". |
-| **Confidence-gated routing** | "The answer tells you *what*; confidence tells you *whether to act*." Threshold the probability to pass / review / block. |
-| **Speculative fan-out** | Ask many questions at once — including ones you may not need — and let your code decide what was relevant. |
-| **Trained with RLCD** | "Reinforcement Learning for Calibrated Decisions": the training objective is calibration, not next-token likelihood. |
+| `out/quickstart/tokenizer/` | Newly trained vocabulary |
+| `out/quickstart/data/` | Data splits and build manifest |
+| `out/quickstart/mlm/mlm.pth` | Pretrained encoder |
+| `out/quickstart/decision/decision.pth` | Decision model |
+| `out/quickstart/decision/decision_opt.pth` | Complete resume state |
+| `out/quickstart/calibration/T.json` | Temperatures and matching checkpoint/tokenizer hashes |
+| `out/quickstart/eval/decision/data_test_known.json` | Metrics and per-example results |
 
-Jev is closed-weight and API-only.
+<a id="first-task"></a>
+## 🚀 II · Use the model for your first task
 
-### What this repository is
+Our example routes a customer request to an appropriate tool. The model selects an option; application code handles the next step.
 
-**MiniSystemOne is a from-scratch, educational reimplementation of that idea** — the same
-relationship MiniMind has to the LLaMA/GPT recipe, applied to decision models instead of
-chat models.
+### 1. Describe the state, question, and candidates
 
-- **From random initialization.** Every other open replica of Jev continues from an
-  existing LLM (Qwen3-0.6B, Gemma, …). This one starts from nothing: a new BPE, an
-  MLM-pretrained encoder, then a decision head. Whole chain is **26.89M parameters and
-  4.7 hours on one 8 GB laptop GPU** — tokenizer, pretraining, decision training and
-  calibration all in this repository.
-- **One encoder, one head, one loss.** Noul, Choice and Score are not three code paths.
-  They are one softmax over a candidate set: Noul is `{yes, no}`, Score is `{1..5}`.
-  Abstention is a candidate, not a branch.
-- **Calibration is the point, so the data has to contain it.** One-hot labels cannot teach
-  a model to be calibrated — a Brier loss on one-hot targets is just a confidence-pushing
-  regularizer. The synthetic generators here emit targets whose **true conditional
-  distribution is known**, which is what makes ECE measurable instead of decorative.
-- **Honest by construction.** Where this project's own projection turned out wrong
-  (per-question amortization, latency), the README says so and strikes it out. Where the
-  model fails (real text, OOD), the number is reported rather than buried.
+Edit [examples/choice.json](examples/choice.json):
 
----
-
-## ⚠️ Not a Jev reproduction
-
-This project is an **independent educational implementation**. It is *inspired by*
-the "System One Model" idea popularized by TypeSafe AI's Jev (2026-09-15),
-the same way [MiniMind](https://github.com/jingyaogong/minimind) is an educational
-reimplementation of the LLaMA/GPT recipe rather than a reproduction of any specific
-model.
-
-**We do not distill Jev's outputs and we make no attempt to reverse-engineer their
-system.** TypeSafe's Master Customer Agreement prohibits exactly that. All training data
-here is either program-generated by the synthetic generators in `dataset/synth/` or
-derived from public datasets via the adapters in `dataset/adapters/`.
-**Nothing flows from Jev into training, and no Jev output is committed to this repo.**
-
-The one place Jev is touched at all is a **benchmark comparison**
-(`eval/compare_apis.py`, results [below](#comparison-against-jev-and-a-general-llm)): the
-same state, questions and candidate sets are sent to `jev-latest` and to this model, and
-only **aggregate** metrics are reported. Benchmarking is not distillation — but it is
-a *different* question under the terms, so this will live in a separate, explicitly
-opt-in script that requires an API key and sits on no training or data-building path.
-Whether the MCA permits it is the account holder's call, not something this repo assumes.
-
-We also **do not claim to beat Jev**, on any axis. See
-[Honest boundaries](#honest-boundaries) — the latency figures are not even in the
-same unit of measurement.
-
----
-
-## The idea in one picture
-
-```
-state tokens            question tokens      candidate 1   candidate 2   ...
-[ ...account data... ]  [ Is this fraud? ]   [fraud]       [legit]       ...
-        seg=STATE              seg=QUESTION      seg=CANDIDATE
-        └──────────── one bidirectional forward ─────────────┘
-                                    │
-                       span pool over state ∪ question → z
-                                    │
-                    per-candidate scorer  f(z, c_i) → logit_i
-                                    │
-                       softmax over the K candidates → p
+```json
+{
+  "state": "The user asks to check their account balance. Available tools: balance_lookup retrieves the balance; transfer_funds moves money.",
+  "question": "Which tool matches the user's request?",
+  "primitive": "choice",
+  "candidates": ["balance_lookup", "transfer_funds", "abstain"]
+}
 ```
 
-**Three primitives, one head.** Noul (yes/no), Choice (dynamic candidate set up to
-255), and Score (ordinal) are all *the same operation*: a softmax over a candidate
-set. Noul is just `{yes, no}`; Score is just `{1, 2, 3, 4, 5}`. There is no separate
-sigmoid head, and **abstention is a candidate rather than a branch** — because
-abstaining *is* a choice among options.
+Put the evidence in `state`, the decision to make in `question`, and the allowed options in `candidates`. Candidates may change between requests, but adding a name does not automatically teach the model a new business rule.
 
-The design is documented in [`docs/DESIGN.md`](docs/DESIGN.md); the calibration
-methodology in [`docs/CALIBRATION.md`](docs/CALIBRATION.md); the frozen data contract
-in [`docs/DATA_SCHEMA.md`](docs/DATA_SCHEMA.md).
+### 2. Call the model and use its output
 
-### Why calibration is the whole point
-
-**One-hot labels cannot teach calibration.** A Brier loss on one-hot targets is just
-a confidence-pushing regularizer: it can never teach a model that "when I say 0.8, I
-should be right 80% of the time," because the training signal contains no information
-about 0.8.
-
-So the training data has to contain samples whose **true conditional distribution is
-known**. This repo builds them three ways — a known randomized rule (`explicit_rng`),
-marginalization over a hidden variable exposed only coarsely in the state
-(`marginalized`), and genuinely tied answer sets (`tie_set`) — and, for real human
-disagreement, from ChaosNLI's ~100 annotations per item (`human_annotators`).
-
-Every metric is reported **bucketed by provenance**, because mixing sources with
-different irreducible noise floors makes ECE meaningless.
-
----
-
-## Results
-
-All numbers below are from `out/decision/decision.pth` — 26.89M parameters, MLM-pretrained
-from random initialization on 67.6M tokens, then 33,795 decision steps. Peak training VRAM
-**3.85 GB**. Reproduce with the commands in [Reproducing](#reproducing).
-
-The external comparison against `jev-latest` and a general LLM is at
-[the end of this section](#comparison-against-jev-and-a-general-llm). Nothing here is
-estimated.
-
-### Calibration on synthetic held-out data
-
-`test_known`, n=18,000, K up to 255. `hard` is excluded from the calibration row
-(`metrics.calibration`) because one-hot targets carry no information about how uncertain
-the world is — pooling them in dilutes ECE toward "looks good".
-
-| | acc | ECE | Brier | NLL |
-|---|---|---|---|---|
-| uncalibrated | 0.647 | 0.0047 | 0.0249 | 1.0821 |
-| global temperature | 0.647 | 0.0038 | 0.0249 | 1.0821 |
-| per-(primitive × K) temperature | 0.647 | 0.0046 | 0.0248 | 1.0800 |
-| **calibration subset** (hard excluded, n=16,361) | **0.612** | **0.0061** | 0.0273 | — |
-
-![synthetic reliability](assets/reliability_synth_test_known.png)
-
-**The temperature has almost nothing to fix.** Fitted `T = 0.965`, and NLL moves
-1.0629 → 1.0628. That is the intended result: the model is *natively* calibrated because
-its targets were distributions to begin with, not one-hot labels smoothed after the fact.
-Temperature calibration is reported here mainly to show it is a no-op.
-
-### Read this table, not the accuracy column
-
-`accuracy` pools two kinds of sample whose ceilings are structurally different, so it
-measures the provenance mix more than the model. On a `tie_set` record the target is
-uniform over the valid answers, so `t[argmax p]` is capped at `1/k` **no matter how good
-the model is**. On a one-hot record the same number is a real accuracy. The honest
-denominator is the **oracle ceiling**: for a perfectly calibrated model `p* = t`, so its
-soft-accuracy is exactly `mean(max_k t_k)` — computable from the data with no model at all.
-
-| source | n | model | oracle ceiling | achieved |
-|---|---|---|---|---|
-| `tool_router` | 3,000 | 0.7137 | 0.7140 | **100.0%** |
-| `security_gate` | 3,000 | 0.6403 | 0.6426 | **99.6%** |
-| `refund_policy` | 3,000 | 0.7561 | 0.7601 | **99.5%** |
-| `marginalized` / `agent_trace_score` | 3,000 | 0.6366 | 0.6450 | **98.7%** |
-| `banking_balance` (`explicit_rng`) | 3,000 | 0.4544 | 0.6091 | **74.6%** |
-| `calendar_slot` | 3,000 | 0.0920 | 0.1416 | **65.0%** |
-
-Four of six generators are essentially solved. The two that are not are the two that
-should be hardest, and for different reasons:
-
-- **`banking_balance`** is the arithmetic one — `q = σ((B − A − fees)/τ)` — and it is also
-  where calibration is worst (**ECE 0.1637** vs 0.0035–0.0495 elsewhere). A 26M encoder
-  cannot do the arithmetic exactly, so it approximates, and its confidence tracks the
-  approximation rather than the answer.
-- **`calendar_slot`** is the large-K one (K up to 255). Both model and oracle sit near 0.1,
-  so this is a genuinely ambiguous task built into the data, not a model failure — but the
-  model still only reaches 65% of what is achievable.
-
-### The BoW gate (pre-registered)
-
-The plan requires the model to beat a bag-of-words lexical probe on `test_known` by ≥0.25,
-else the generators are declared over-templated and **no model metric may be reported**.
-The gate was recorded before any checkpoint existed (0.315 lexical upper bound).
-
-```
-真实模型 test_known 准确率 0.647
-模型 − 词法上界 = +0.332，门槛 ≥0.25  → 通过
-```
-
-Gate **passes**. Note this passes on the pooled `accuracy`; the per-source table above is
-the reading that survives scrutiny.
-
-### Calibration on real human disagreement (ChaosNLI)
-
-![chaosnli reliability](assets/reliability_public_test_known_public-chaosnli.png)
-
-474 items, N≈100 annotators each. **ECE 0.0613**, binomial noise floor **0.0068**,
-noise-corrected **0.0545**. The floor explains only 11% of it: on real text the model is
-genuinely miscalibrated, and no noise correction rescues that claim. The temperature panel
-is a no-op by design — the synthetic `T` does not transfer, and applying it here would
-produce a pretty wrong number.
-
-**Do not read the pooled `human_annotators` figure (ECE 0.3167).** It averages ChaosNLI
-with GoEmotions, whose 3–5 annotators quantize targets to multiples of 1/3…1/5 (GoEmotions
-alone: ECE 0.3253, floor 0.0044). The pooled number measures the mixing ratio, which is
-exactly why `--source` is mandatory for this figure.
-
-### Synthetic → real gap
-
-**0.612 → 0.424 soft-accuracy** (synthetic calibration subset → ChaosNLI / GoEmotions on
-real text). Roughly **19 points** of accuracy are lost crossing from program-generated rules
-to real natural language. Accuracy on the harder public splits — CLINC150, banking77,
-Amazon — is 0.157, close to but above chance.
-
-This is the project's most informative single number and it is reported as a limitation,
-not a footnote.
-
-### Efficiency — and two projections this project got wrong
-
-Measured on the real per-request path (`model.decide_chunked`), 200 distinct samples,
-RTX 4070 Laptop.
-
-| | value |
-|---|---|
-| latency (B=1, per sample) | **20.24 ms** median, 27.09 ms p95, 17.23–33.23 ms range |
-| throughput | 49.4 samples/s |
-| median sample | state 87 tok, question 8 tok, 3 candidates |
-| peak VRAM | **0.13 GB**, flat across B∈{1,8} × K∈{2,32,128,255} |
-| K=255 | 49.97 ms median (chunked path) |
-
-**Latency is overhead-bound, not compute-bound — and that is measurable.** K=2 takes
-19.88 ms and K=32 takes 18.37 ms: adding 30 candidates costs *nothing*, because a fixed
-per-call cost dominates. That also explains why the 5.87 ms figure quoted during design
-(a raw forward on a prepared tensor) does not survive: the real path builds masks,
-positions and the packing every call.
-
-**Per-question amortization does not materialize.** The design projected ~3.3× at N=16
-from prefix KV reuse. Measured:
-
-| N questions sharing one state | naive | cached | speedup |
-|---|---|---|---|
-| 1 | 19.07 ms | 25.86 ms | **0.74×** |
-| 4 | 78.45 ms | 85.83 ms | 0.91× |
-| 16 | 440.04 ms | 423.20 ms | **1.04×** |
-| 64 | 1451.66 ms | 1184.07 ms | 1.23× |
-
-Breakdown: `encode_state` 7.31 ms, `encode_prefix` 8.69 ms, full question 19.85 ms. So a
-cached question costs 8.69 ms for 11 tokens — the saving is real in the arithmetic but
-swamped by the same fixed overhead. **The architectural property is not in doubt** (smoke
-test `[D]` shows prefix hidden states are bit-for-bit independent of the candidates, which
-is what makes reuse *correct*), but at the sequence lengths this task actually produces
-(state ≈ 87 tokens) there is almost nothing to amortize. The amortization claim needs long
-states to be worth anything, and this data does not have them.
-
-### Comparison against Jev and a general LLM
-
-`eval/compare_apis.py` — 48 items, stratified across the six generators, candidates ≤ 8,
-**the same inputs and the same `eval_metrics.py` scoring all three**.
-
-| system | n | dropped | soft-acc | **ECE** | Brier | **ms/item** | output tokens |
-|---|---|---|---|---|---|---|---|
-| **ours** | 48 | **0** | 0.5968 | **0.0248** | 0.0235 | **4.3** | **0** |
-| `jev-latest` | 48 | 0 | 0.5226 | 0.2164 | 0.2165 | 1464.6 | 2,781 |
-| `deepseek-flash` | 37 | **11** | **0.6711** | 0.0538 | 0.0524 | 5650.9 | 139,731 |
-
-**Read the caveats before the numbers.**
-
-- **Ours was trained on this distribution; the other two are zero-shot.** That favours us
-  on accuracy — and DeepSeek *still beats us on it* (0.6711 vs 0.5968) while dropping the
-  23% of items whose reasoning consumed its budget. This is the boundary stated under
-  [Honest boundaries](#honest-boundaries): **we do not claim to win on accuracy.**
-- **DeepSeek's 11 empty responses are a budget artifact, not a hard failure.** Its API
-  accepts `max_tokens` up to 65536; we set 8192 and the reasoning stage spent all of it.
-  It is a latency/cost-versus-reliability trade-off — one our model simply does not face,
-  at 4.3 ms and zero output tokens.
-- **Jev's ECE here does not contradict TypeSafe's claims.** Their published guarantee is
-  run-to-run *stability* (σ = 0.0102 on their own tasks), not agreement with our
-  generator's `P*`. Those are different propositions, and this table only measures the
-  second one.
-- **n = 48, eight per generator.** This shows a shape, not a citable number.
-
-What survives: the state renders all the evidence — `audit_synthetic.py`'s
-rendering-sufficiency check proves `P*` is **100% recoverable from the rendered text** —
-so all three systems see the same information. On that footing, Jev's reported
-probabilities sit **8.7× further from the true conditional distribution** than ours. That
-is the "ranking with a confidence gap" versus "calibrated distribution" distinction,
-measured rather than asserted.
-
-Reproduce with `python eval/compare_apis.py` (opt-in; needs `TYPESAFE_API_KEY` and
-`DEEPSEEK_API_KEY`; **on no training or data-building path**; writes aggregate metrics
-only, never per-sample output from an external model).
-
-### Pre-registered gates — recorded before any model existed
-
-`scripts/audit_synthetic.py` runs on the **data alone**, so these numbers were fixed
-before the first checkpoint was trained. They are here so the model's score can be read
-against a floor that was not chosen after the fact.
-
-```
-========== 2. schema contract ==========
-  210000 records checked, 0 problems        (train 180k / val 6k / calib 6k / test_known 18k)
-
-========== 3. split disjointness (re-checked at the data layer) ==========
-  train 384, val 48, calib 48, test_known 240  (source, template, pool) combinations
-  0 overlaps
-
-========== 4. rendering sufficiency ==========
-  every soft-target record, every generator, every split: 100% recoverable
-  (this is the check that P* depends only on what is actually rendered into `state`;
-   a single failure here would mean the model is being asked to predict a coin flip)
-```
-
-**The lexical gate (R2).** A bag-of-words logistic regression — candidate words, plus
-whether each candidate word co-occurs in `state`/`question` — is trained on a stratified
-30k sample of `train` and scored on the held-out splits. It is the strongest
-*non-semantic* matcher the generators could be accused of rewarding.
-
-| split | lexical upper bound | random | lead |
-|---|---|---|---|
-| `val` | 0.336 | 0.284 | +0.052 |
-| `calib` | 0.332 | 0.284 | +0.047 |
-| `test_known` | **0.315** | 0.280 | +0.036 |
-
-**The gate: the trained model must beat 0.315 by ≥ 0.25 → ≥ 0.565 on `test_known`.**
-If it does not, the generators are over-templated and *no model metric may be reported*
-until they are diversified. **Run against the final checkpoint: 0.647, i.e. +0.332 —
-passes.** Re-run it with:
-
-```bash
-python scripts/audit_synthetic.py --model_eval out/eval/decision/decision/synth_test_known.json
-```
-
-(The filename carries the data stem — `eval_harness.py` writes
-`out/eval/<--out>/<ckpt-stem>/<data-stem>_<set>.json`, because the flagship flow runs
-`--sets test_known` on `dataset/synth` and `dataset/public` into the *same* directory.)
-
-A +0.036 lexical lead is a genuinely low bar, which is the point: it means the tasks
-are decided by *arithmetic and rule application over rendered evidence*, not by which
-words appear next to which. Two per-generator readings are worth stating now, because
-they explain lines in the table that would otherwise look like failures:
-
-- **`tool_router` leads by +0.157** (+0.211 en / +0.220 mixed). This is by design and not
-  a leak: mapping an intent phrase to a tool name *is* the task, so lexical overlap is
-  the intended solution rather than a shortcut around it.
-- **`refund_policy` scores −0.008** — at random, i.e. the probe gets nothing. The
-  separate answer-leakage probe (state + question, *no candidates*) does score 0.812 on
-  it, which is not leakage but a lookup table: its input space is discrete enough that
-  the probe memorizes it. That caveat travels with any `refund_policy` number.
-
-The de-numbered leakage column is the one to read for the rest:
-`banking_balance` 0.358 (−0.017), `agent_trace_score` 0.209 (+0.009),
-`security_gate` 0.340 (+0.007) — all at random, which is what an arithmetic task should
-look like. `calendar_slot` lands at 0.003, *below* random: string matching cannot reach
-its candidates at all.
-
-### Already verified — no training required
-
-These are **architectural** properties, so they hold at random initialization and are
-reproducible right now with `python scripts/smoke_test.py`. They are the load-bearing
-claims about the *design*, independent of how well the model learns.
-
-```
-[A] candidate independence    max|Δlogit| = 7.8e-03
-[B] permutation invariance    max|Δp|     = 5.4e-04
-[C] chunk invariance          max|Δp|     = 6.2e-04
-[D] prefix unaffected by candidates  max|Δh_prefix| = 0.000e+00   ← exactly zero
-[E] mask sanity               fully-masked rows = 0, inf = 0, illegal visibility = 0
-[F] position assignment       prefix_len=42, K=5, inconsistencies = 0
-[H] 255 candidates, one forward   S=6312 → logits (1, 255), peak 1740 MB,
-                                  max|Δp| vs chunked path = 2.8e-05
-```
-
-Note **[D] is exactly `0.0`**, not merely small. With `prefix_blocked=True` the prefix
-hidden states are bit-for-bit independent of which candidates are present — prefix
-blocking masks those attention rows outright. That exactness is what makes prefix KV
-reuse correct rather than an approximation, and it is what the per-question
-amortization claim ultimately rests on.
-
-`[B]`/`[C]` are approximate only because bf16 arithmetic is not associative; the
-tolerance is `2e-02` and they land two orders of magnitude inside it.
-
----
-
-## Honest boundaries
-
-This section is written **before** the results land, on purpose, so that it cannot be
-quietly adjusted to fit whatever comes out. It is a set of falsifiable predictions.
-
-### What a 26M-parameter from-scratch encoder should be able to do
-
-- Learn **programmatically verifiable synthetic decision rules** to high accuracy,
-  when the rules are lexically simple and the evidence is explicitly present in the state.
-- Produce **genuinely calibrated** probabilities, validated against known `P*` on
-  `test_known` and against ChaosNLI's 100-annotator distributions.
-- Beat a finetuned AR LLM's **verbalized confidence** on ECE, measured with the *same*
-  ECE code path.
-- Decide in **a single forward pass** with a small memory footprint, and support
-  **255 candidates** at typical candidate lengths.
-- Provide **exact candidate-order invariance** when `candidate_crosstalk=False`.
-- ~~~3.3× per-question amortization at N=16.~~ **Falsified — see
-  [Efficiency](#efficiency--and-two-projections-this-project-got-wrong).** Measured
-  1.04× at N=16 and 0.74× at N=1. The prediction assumed state would dominate the
-  sequence; at this data's actual lengths (state ≈ 87 tokens) fixed per-call overhead
-  swamps the saving. It was marked a prediction rather than a promise, and it did not
-  hold.
-- ~~~6 ms per decision, ~2.8 ms/sample batched.~~ Those were raw-forward figures.
-  The real per-request path measures **20.24 ms** median / 27.09 ms p95 — overhead-bound,
-  as the flat K=2 → K=32 latency shows. VRAM is the part that held: 0.13 GB.
-
-### What it should **not** be able to do
-
-- **Match an LLM's open-domain NLU.** ChaosNLI accuracy will be far below an LLM's.
-  That number is reported as a *calibration* demonstration, and this README will say
-  so rather than hide it.
-- **Handle arbitrary real text without a task schema.** It is a **schema-bound decision
-  model**, not a general assistant.
-- **Reach its own synthetic accuracy on real text.** That gap will be measured and
-  reported as the headline honesty number, not buried.
-- **Win on accuracy against a language model.** The claims are latency, native
-  calibrated distributions, and **zero schema errors by construction** — not accuracy.
-- **Give reliable probabilities on genuinely OOD inputs.** No model does. The
-  ChaosNLI figure above *shows* the OOD calibration degradation (ECE 0.0613 against a
-  0.0068 noise floor) rather than claiming otherwise.
-- **Replace an LLM in any sense.** It is a component. The framing of this README is
-  "here is what a 26M decision-native model looks like and what it costs" — not
-  "here is an LLM alternative."
-
-### Explicit commitment
-
-**If the 26M model turns out to be too weak to work outside the synthetic generators,
-this README will say so plainly.** The synthetic-to-real gap is itself a real result,
-and it will be reported whether or not it is flattering.
-
-### Known measurement caveats
-
-These are recorded up front because each one, if discovered late, would look like an
-excuse:
-
-1. **Latency is not comparable to Jev's 70–500 ms.** That figure is *LLM inference*
-   latency (a decode loop over text). Ours is a *single forward pass*. Different unit,
-   different claim. We do not claim to beat it.
-2. **ChaosNLI here is MNLI-only** (the mirror available to us), 1599 items — not the
-   full SNLI+MNLI+ANLI union. Its `test_known` split is 474 items, which is thin.
-   Equal-mass binning keeps ~50 per bin; per-bin counts are printed on every plot.
-3. **The public sets are not natural distributions.** `amazon_score`'s val/test splits
-   are class-balanced (1000 per star) rather than the natural J-shaped review
-   distribution, so its accuracy is *balanced* accuracy. `amazon_score`'s `train`
-   split is unusable (placeholder labels), so it is a pure evaluation set.
-4. **The SDPA backend conclusions were measured on torch 2.5.1+cu121**, while
-   `requirements.txt` pins 2.6.0+cu124. The float-vs-bool mask and
-   EFFICIENT-vs-MATH findings need re-verification on the pinned version.
-5. **MLM wall-clock is longer than a naive reading of the plan suggests.** The default
-   is 8 epochs over ~95M tokens (~540M tokens seen), which is ≈21 tokens/parameter —
-   roughly compute-optimal for a 26M model, but far more than a single 32-minute epoch.
-
----
-
-## Model tiers
-
-Both tiers deliberately mirror MiniMind's shapes, so the warm-start ablation needs no
-shape changes. Verify these with `python scripts/model_stats.py` — that script
-instantiates the classes on CPU and prints the breakdown, so you can falsify any
-number here in seconds.
-
-| Tier | hidden | layers | heads | ffn | Total | Composition |
-|---|---|---|---|---|---|---|
-| **26M** (primary) | 512 | 8 | 8/4 (GQA) | 1280 | **26.89M** | encoder 22.03M + embed 3.28M + head 1.58M |
-| **65M** | 768 | 8 | 8/4 (GQA) | 2304 | **65.11M** | encoder 56.64M + embed 4.92M + head 3.55M |
-
-Stage 1 (`MiniSystemOneForMaskedLM`) is **25.31M** — exactly 1.58M *less* than the
-decision model, that difference being the `DecisionHead`; its `lm_head` is tied to
-`embed_tokens` and adds **zero** parameters. Run `python scripts/model_stats.py` to
-check every number in this table in seconds.
-
----
-
-## Tokenizer
-
-A new BPE, **vocab 6400**, 11 special tokens, `model_max_length=8192`, no BOS/EOS,
-**no `chat_template`** (a decision model has no conversation template; canonical
-serialization is *code* — `model/serialize.py` — not a Jinja string).
-
-```
-<pad> <unk> <cls> <sep> <mask> <trunc> <yes> <no> <abstain> <ans> </ans>
- 0     1     2     3     4      5       6     7     8        9     10
-```
-
-`<yes>`, `<no>` and `<abstain>` are **single-token** candidates on purpose: it keeps the
-pooled vector for the two Noul answers maximally clean, and Noul is a first-class
-primitive, so giving it atomic answer tokens is a real modelling choice rather than a
-convenience.
-
-Measured compression (`python trainer/train_tokenizer.py --tokenizer_path model`).
-The reference column is MiniMind's own tokenizer on the identical samples:
-
-| Sample set | chars/token | Gate | MiniMind ref |
-|---|---|---|---|
-| Chinese | **1.44** | 1.42 | 1.40 |
-| English | **3.16** | 3.15 | 3.39 |
-| Mixed | **2.53** | 2.50 | 2.41 |
-| **Real generator text** | **3.13** | **2.60** | 2.03 |
-
-Two honest notes about this table:
-
-- **The first three rows are illustrative, not a gate that means much.** English sits
-  0.01 above its threshold — that row is essentially vacuous. It is deliberately set
-  *below* MiniMind's reference because the English samples are LLM-written expository
-  prose, which is precisely the reference tokenizer's home turf. The English we actually
-  serve is CLINC150 / banking77 short user utterances, GoEmotions and Amazon reviews.
-- **The last row is the real gate.** It measures text rendered by the actual generators —
-  what the model will really read. That is the quantity that determines sequence length,
-  truncation rate, and whether 255 candidates fit in a single forward pass.
-
-The original design document specified `en ≥ 3.60`. **That target was impossible** —
-MiniMind's own tokenizer only reaches 3.39 on the same samples — so it had been guessed
-rather than measured. It has been replaced with a measured value plus the explanation.
-
----
-
-## Repository layout
-
-```
-model/
-  model_system_one.py     Config, RMSNorm, RoPE, Attention, Encoder, AttnPool,
-                          DecisionHead, ForDecision / ForMaskedLM / ForCausalLM
-  serialize.py            The only canonical packing: pack_example, build_attn_mask,
-                          build_position_ids, collate_packed, head/tail truncation
-  tokenizer.json          A NEW BPE, vocab 6400, 11 special tokens
-  tokenizer_config.json
-dataset/
-  pretrain_corpus.py      THE corpus source of truth: fetch (one-time, network) + blend,
-                          and iter_corpus shared by the tokenizer and MLM stages
-  decision_dataset.py     DecisionDataset (+K subsampling), collate_decision,
-                          CandidateBucketSampler
-  mlm_dataset.py          Span masking, 80/10/10
-  synth/                  Six generators, registry + base + lexicon
-  adapters/               chaosnli, clinc150, banking77, goemotions, amazon_score
-trainer/
-  trainer_utils.py        get_lr, Logger, init_model, save_checkpoint, oom_retry,
-                          unbuffer_stdout
-  train_tokenizer.py      Trains the BPE and enforces compression-rate gates
-  train_mlm.py            Stage 1: MLM pretraining
-  train_decision.py       Stage 2: CE + λ_b·Brier + λ_o·CDF-MSE
-  calibrate_temperature.py  LBFGS on log T, three granularities
-eval/
-  eval_metrics.py         Pure functions: accuracy, nll, brier, ece, reliability_curve,
-                          risk_coverage_curve, ordinal_mae, expected_score,
-                          binomial_noise_floor, bootstrap_ci
-  eval_harness.py         Writes metrics / by_provenance / per_sample
-  eval_efficiency.py      Latency, throughput, VRAM, question amortization
-  make_reliability_plot.py
-scripts/
-  build_dataset.py        Synthetic generators or public adapters
-  audit_synthetic.py      BoW gate — the most valuable script in the repo
-  audit_leakage.py        Position probe — must stay at chance
-  model_stats.py          Parameter breakdown table
-  tok_probe.py            Tokenizer compression probe (used while tuning the BPE)
-  smoke_test.py           Invariance assertions
-docs/                     DESIGN.md, DATA_SCHEMA.md, CALIBRATION.md
-assets/                   The two reliability figures the README embeds
-```
-
-Style follows MiniMind: no `pyproject.toml`, no package install, scripts run directly
-with `sys.path.append`, argparse-only CLI, `AdamW`, autocast + `GradScaler`, optional
-swanlab logging, Chinese help text.
-
-**Not committed:** `out/` (checkpoints, eval JSONs, logs), `*.pth`, `dataset/**/*.jsonl`,
-and `dataset/pretrain_en*.jsonl`. All are regenerable from the scripts above — see
-`.gitignore` for the reasoning on each.
-
-### What's in a checkpoint
-
-`mlm.pth` and `decision.pth` are **self-describing**: the file carries the config it was
-built from and the provenance of its training data, so you never hand-copy
-hyperparameters or guess whether a tokenizer belongs with it.
+Save this as `route_demo.py` in the repository root and run `python route_demo.py`. It uses the quick-start artifacts; replace them with weights trained and evaluated on your task for actual use.
 
 ```python
-from trainer.trainer_utils import ckpt_info
-print(ckpt_info("out/decision/decision.pth")["meta"])
-# {'stage': 'decision', 'step': 33795, 'n_params': 26889729,
-#  'tokenizer_sha1': 'bf7a131a109ea445', 'gen_version': '1.0.0',
-#  'encoder_init': 'mlm.pth', 'trained_on': 'synth', 'max_len': 1024, 'epochs': 3}
+import json
+from model.inference import DecisionPredictor
+
+predictor = DecisionPredictor(
+    checkpoint="out/quickstart/decision/decision.pth",
+    tokenizer="out/quickstart/tokenizer",
+    device="cpu",
+)
+with open("examples/choice.json", encoding="utf-8") as f:
+    request = json.load(f)
+
+result = predictor.predict(request)
+print(json.dumps(result, ensure_ascii=False, indent=2))
+
+# 0.8 is illustrative; select a threshold on your validation set.
+choice = result["choice"]
+if result["confidence"] < 0.8 or choice == "abstain":
+    destination = "human review"
+else:
+    destination = {
+        "balance_lookup": "balance lookup workflow",
+        "transfer_funds": "transfer request workflow",
+    }[choice]
+print("Route request to:", destination)
 ```
 
-Two guards use that metadata, and both exist because the failure they prevent is
-**silent**:
+The output includes candidate `probabilities`, the highest-probability `choice`, its `confidence`, and `state_truncated` and `temperature_applied`. This program makes a routing decision; it does not invoke a banking API.
 
-- **`init_model` rejects a mismatched architecture.** If the checkpoint records
-  `hidden_size=512` and you pass 768, it exits. Otherwise `strict=False` leaves part of
-  the model at random initialization and the evaluation still runs to completion — a full
-  table of plausible numbers, computed from a half-random model.
-- **`verify_tokenizer` rejects a mismatched vocabulary.** Both tokenizers are vocab 6400,
-  so embeddings always have the right shape, loading never complains, and every token id
-  points at a different word than the weights were trained on.
+### 3. Answer the other two question types
 
-Neither guard existed when the weights were first trained; both were added when the
-checkpoints were prepared for release. `scripts/model_stats.py` remains the way to check
-the parameter counts in the table above.
+![Actual outputs from all three interfaces and the human-review fallback](assets/readme/task-demo.png)
 
----
+These are actual outputs from the repaired quick-start model on the three repository examples. After only five training steps per stage, probabilities remain near uniform. The Choice request goes to human review because confidence is below the illustrative 0.8 threshold. This demonstrates the interface and fallback, not task competence.
 
-## Reproducing
-
-```bash
-conda create -n minimind python=3.12
-pip install -r requirements.txt
+```shell
+python scripts/decide.py --tokenizer out/quickstart/tokenizer --ckpt out/quickstart/decision/decision.pth --input examples/noul.json --device cpu
+python scripts/decide.py --tokenizer out/quickstart/tokenizer --ckpt out/quickstart/decision/decision.pth --input examples/score.json --device cpu
 ```
 
-### 0. Corpus (one-time, needs network)
+- **Noul:** supply `state`, `question`, and `primitive: "noul"`. Candidates are fixed to `yes/no`; output also includes `p_true`.
+- **Score:** supply candidate texts and matching `levels`, such as `[3, 1, 2]`. Output also includes `expected_score = Σ p_i × level_i`.
 
-`dataset/pretrain_en*.jsonl` is **not committed** — it is 61 MB of downloadable corpus.
-Rebuild it before anything else (~20 min). Training never touches the network; only this
-step does.
+Inference keeps at most 512 state tokens by default, with at most 128 tokens for the question and for each candidate. State truncation is flagged in the output. Adjust the context budget and candidate chunk size with `--max_state_tokens` and `--chunk`. Load matching temperatures with `--calibration T.json`; calibration evidence applies to the evaluated domain, not automatically to every task.
 
-```bash
-python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_alpaca.jsonl \
-    --dataset tatsu-lab/alpaca --fields instruction,input,output
-python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_wiki.jsonl \
-    --dataset Salesforce/wikitext --config wikitext-103-raw-v1 --fields text \
-    --strip_wiki_title --min_chars 600 --n_docs 60000
+<a id="datasets"></a>
+## 📚 III · Datasets: what the model learns from
+
+The project uses three layers of data: **language pretraining corpora, synthetic decision data, and public real-text datasets**. They serve different purposes.
+
+### 1. Language pretraining corpora
+
+| Data | Purpose | Local file |
+|---|---|---|
+| MiniMind `pretrain_t2t_mini.jsonl` or your own Chinese text | Chinese representations and vocabulary | This guide uses `dataset/pretrain_zh.jsonl` |
+| `tatsu-lab/alpaca` | English instruction/conversation phrasing; concatenate instruction/input/output as plain text | `dataset/pretrain_en_alpaca.jsonl` |
+| `Salesforce/wikitext`, `wikitext-103-raw-v1` | Additional English text | `dataset/pretrain_en_wiki.jsonl` |
+| Rendered synthetic task text | Tool names, grades, amounts, and domain terms | Generated during corpus construction |
+
+Pretraining input contains one document per line, for example `{"text": "The account has passed identity verification."}`. There are no candidate-selection labels at this stage: the tokenizer learns segmentation and MLM learns to recover masked tokens. Using Alpaca text here does not make this conversational SFT.
+
+### 2. Six synthetic decision tasks
+
+Rule-based programs in [dataset/synth/](dataset/synth/) generate Chinese, English, and mixed-language examples. Target probabilities come from explicit generative rules, rather than invented confidence values.
+
+| Generator | Task | Primitive | Target source |
+|---|---|---|---|
+| `banking_balance` | Read balances, amounts, and fees to approve or route | Noul / Choice | Known random rule |
+| `tool_router` | Match a request to a tool | Choice | Unique answer or tied valid answers |
+| `agent_trace_score` | Rate an execution trace | Score | Marginalization over partially observed quantities |
+| `security_gate` | Allow, review, or deny based on risk evidence | Choice | Marginalization or tied answers |
+| `refund_policy` | Combine priors and verification evidence for a refund decision | Noul | Known probability rule or marginalization |
+| `calendar_slot` | Choose among available time slots | Choice | Known random selection rule |
+
+Default full-build splits can be checked against the [manifest](dataset/synth/manifest.json):
+
+| Split | Examples | Purpose |
+|---|---:|---|
+| `train` | 180,000 | Update model weights |
+| `val` | 6,000 | Monitor training and select settings |
+| `calib` | 6,000 | Fit temperatures after freezing the model |
+| `test_known` | 18,000 | Held-out templates or entity pools within the same task families |
+| `test_ood` | 0 by default | Available only when entire generators are held out |
+
+Splitting operates on `template_id × entity_pool` combinations. `test_known` holds out templates or entity pools; `val/calib` use combinations disjoint from training. This reduces the opportunity to score well by memorizing similar sentences.
+
+### 3. Anatomy of a training example
+
+Training JSONL uses candidate objects with metadata. Inference JSON uses a list of candidate strings. They serve different purposes.
+
+```json
+{
+  "id": "my_router::train::000001",
+  "source": "custom:router",
+  "gen_version": "1.0.0",
+  "split": "train",
+  "state": "The user wants to check their account balance.",
+  "question": "Which tool should be called?",
+  "schema": {"primitive": "choice", "name": "customer_router"},
+  "candidates": [
+    {"text": "balance_lookup", "label": "balance"},
+    {"text": "transfer_funds", "label": "transfer"},
+    {"text": "abstain", "label": "abstain"}
+  ],
+  "target": {"kind": "hard", "p": [1.0, 0.0, 0.0], "provenance": "hard"}
+}
+```
+
+`target.p` follows candidate order and sums to 1. Reordering candidates requires reordering targets too. For Score, each candidate also needs its actual numeric grade in `meta.level`. Sorting and distance calculations use that grade, not its position in the list.
+
+Hard labels are valid signals for probability learning. Known soft distributions make prediction-to-target distribution comparisons more direct. Do not arbitrarily turn a hard label into 0.8 to manufacture calibration. See the [data schema](docs/DATA_SCHEMA.md) for the complete contract.
+
+### 4. Public real-text datasets and evaluation
+
+[dataset/adapters/](dataset/adapters/) converts public data into this format using project-specific candidates and splits. Results are therefore not directly comparable to original benchmark leaderboards.
+
+| Source | Adapted task | What it probes |
+|---|---|---|
+| `metaeval/chaos-mnli-ambiguity` | Three-way NLI with annotator distributions | Probability prediction under real human disagreement |
+| `clinc/clinc_oos` (plus) | Intent selection, including out-of-scope handling | Real requests and larger candidate sets |
+| `PolyAI/banking77` | Banking intent selection | Transfer to business-language classification |
+| `google-research-datasets/go_emotions` (raw) | Emotion vote distributions | Disagreement among a small number of annotators |
+| `SetFit/amazon_reviews_multi_en` | Ordinal ratings from one to five stars | Rating prediction from real text |
+
+Three details matter: GoEmotions multi-label votes are normalized into distributions, retaining examples with at least two voted emotions, so this is not the original 28-class evaluation; the Amazon adapter reads only validation/test; default decision training reads only `dataset/synth`. **Building public data does not automatically add it to training.**
+
+Public adapters prefer native splits and carve out calibration data according to their rules. Sources without suitable native splits use stable hash buckets. Check the generated `manifest.json` for actual counts.
+
+<a id="training"></a>
+## 🛠️ IV · Build and train step by step
+
+This section uses the default 26.89M configuration. New tokenizers, datasets, and weights live under `out/full/`, separate from the bundled tokenizer and older runs.
+
+### 📚 Step 1 · Prepare language corpora
+
+Download `pretrain_t2t_mini.jsonl` from the [MiniMind dataset](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main) and save it as `dataset/pretrain_zh.jsonl`, or provide your own `{"text": ...}` JSONL. Then prepare English data:
+
+```shell
+python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_alpaca.jsonl --dataset tatsu-lab/alpaca --fields instruction,input,output
+python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_wiki.jsonl --dataset Salesforce/wikitext --config wikitext-103-raw-v1 --fields text --strip_wiki_title --min_chars 600 --n_docs 60000
 python dataset/pretrain_corpus.py blend --out dataset/pretrain_en.jsonl
 ```
 
-> **Skipping this does not fail — it silently degrades.** `iter_mixed` guards the English
-> file with `os.path.exists` and substitutes an empty iterator, so the run completes,
-> prints a normal-looking corpus line, and produces an **English-blind encoder**. A fresh
-> clone is one forgotten command away from that. (The tokenizer's compression gate will
-> likely catch it; nothing downstream of it will.)
+Downloads need network access; subsequent training reads local files. External datasets retain their own licenses. Passing the Chinese path explicitly avoids depending on the script's original `../minimind/...` default.
 
-### 1. Tokenizer
+### 🔤 Step 2 · Train a BPE vocabulary
 
-```bash
-python trainer/train_tokenizer.py
+```shell
+python trainer/train_tokenizer.py --pretrain_path dataset/pretrain_zh.jsonl --en_path dataset/pretrain_en.jsonl --out_dir out/full/tokenizer
 ```
 
-A new BPE (vocab 6400) trained on the pretraining corpus **∪ the synthetic decision
-corpus**. That union is not obvious but matters: if the tokenizer has never seen
-`transfer_ownership`, `Neutral`, or `¥1,240.00`, they shatter into many tokens, the
-candidates get longer, and the pooled vector the scorer sees gets noisier. Cost: zero.
+The target vocabulary size is 6,400, including special tokens such as `<pad>`, `<sep>`, `<mask>`, and `<trunc>`. Tool names and numeric formats also enter tokenizer training. The script checks compression; after changing the tokenizer, rebuild data and train a matching model.
 
-We do **not** reuse MiniMind's tokenizer. Its 36 special tokens are mostly
-vision/audio/tool tokens a decision model never emits — and it lacks `<mask>`,
-`<sep>`, `<pad>`, `<trunc>`, while its `pad_token` *is* its eos token.
+### 🔎 Step 3 · Generate and audit decision data
 
-### 2. Data
-
-```bash
-python scripts/build_dataset.py                        # synthetic
-python scripts/build_dataset.py --public               # public adapters
-python scripts/audit_leakage.py --data dataset/synth
-python scripts/audit_synthetic.py --data dataset/synth
+```shell
+python scripts/build_dataset.py --tokenizer out/full/tokenizer --out out/full/synth
+python scripts/audit_leakage.py --data out/full/synth
+python scripts/audit_synthetic.py --data out/full/synth
 ```
 
-**The audits are gates, not reports.** If `audit_synthetic.py` fails — i.e. a bag-of-words
-logistic regression gets within 25 points of the model on `test_known` — the generators
-are over-templated and must be diversified *before* any model result is reported.
+Audits check positional shortcuts, split separation, whether targets can be recovered from rendered evidence, and lexical baselines. Before model training, the lexical comparison reports only its baseline. Supply `--model_eval` after training to compare model results.
 
-Splits are made by **`template_id` × `entity_pool`, never at random per record.** This
-is what makes `test_known` a real held-out set, and it is enforced by assertions in
-`build_dataset.py`.
+### 🧠 Step 4 · Build the shared encoder
 
-### 3. Train
+Start with [model/model_system_one.py](model/model_system_one.py) and [model/serialize.py](model/serialize.py). Follow this data path:
 
-```bash
-python trainer/train_mlm.py                                   # Stage 1: encoder
-python trainer/train_decision.py --encoder out/mlm/mlm.pth    # Stage 2: decisions
+```text
+state + question + candidates
+             │
+        BPE tokenizer
+             │
+[state] [SEP] [question] [SEP] [candidate 1] [SEP] ...
+             │
+    Shared Transformer encoder
+     ├─ Pool state + question → z
+     └─ Pool each candidate   → c_i
+             │
+      Shared scorer f(z, c_i)
+             │
+       softmax(logits) → p
 ```
 
-### 4. Calibrate and evaluate
+The encoder uses RMSNorm, RoPE, SwiGLU, and grouped-query attention. Attention is constrained: state attends to state; question attends to state and itself; each candidate attends to the prefix and itself, but not other candidates. This enables prefix caching and makes each candidate's score independent of its presentation order.
 
-```bash
-python trainer/calibrate_temperature.py \
-    --ckpt out/decision/decision.pth --data dataset/synth --out out/calibration
+Check the default parameter count:
 
-python eval/eval_harness.py --ckpt out/decision/decision.pth \
-    --data dataset/synth --sets test_known \
-    --temperature out/calibration/T.json --out out/eval/decision
-
-# The real-text run, on the public set. **No `--temperature` here**: see the note
-# below — the synthetic temperature does not transfer.
-python eval/eval_harness.py --ckpt out/decision/decision.pth \
-    --data dataset/public --sets test_known --out out/eval/public
-
-python eval/make_reliability_plot.py \
-    --eval out/eval/decision/decision --sets test_known --binning equal_mass \
-    --out assets
-
-# The human-disagreement figure. `--source` is required: `human_annotators` covers
-# both ChaosNLI (N≈100) and GoEmotions (N=3–5), and their noise floors differ by
-# more than an order of magnitude — averaged together the number measures the mix.
-python eval/make_reliability_plot.py \
-    --eval out/eval/public/decision --sets test_known \
-    --source public:chaosnli --binning equal_mass --out assets
+```shell
+python scripts/model_stats.py --tier 26m
 ```
 
-> **Do not apply the synthetic temperature to ChaosNLI.** The two sets have different
-> logit distributions, and `T` was fitted on the confidence distribution of
-> `test_known`-like records. The correct treatment on real text is to fit separately
-> on its own dev split, or to report the raw uncalibrated ECE. Mixing produces a
-> pretty but wrong number.
+Noul has two candidates, Choice has a dynamic candidate set, and Score adds numeric levels. There is no need for three separate classifiers.
 
-`calibrate_temperature.py` writes `T.json` containing **the SHA1 of the checkpoint and
-the tokenizer**, because temperature is bound to specific weights — a `T.json` from a
-different model would otherwise be silently accepted.
+### 🔥 Step 5 · Pretrain the encoder with MLM
 
----
+```shell
+python trainer/train_mlm.py --tokenizer out/full/tokenizer --pretrain_path dataset/pretrain_zh.jsonl --en_path dataset/pretrain_en.jsonl --out out/full/mlm --log_dir out/full/mlm/logs --save_optimizer --no_swanlab
+```
 
-## Two things that will bite you on Windows
+This stage starts from random weights. The temporary MLM output head shares weights with the token embedding and learns to recover selected text positions. Its `mlm.pth` initializes the next stage's encoder.
 
-Both were hit during development, and both are the kind of failure that looks like
-something else entirely.
+### 🎯 Step 6 · Train the decision head and encoder
 
-1. **`import datasets` (pyarrow) must precede `import torch`.** Otherwise the process
-   dies silently — exit code 139, zero output, no traceback. `train_mlm.py` keeps
-   MiniMind's original `import datasets  # noqa: F401` for this reason.
+```shell
+python trainer/train_decision.py --tokenizer out/full/tokenizer --data out/full/synth --encoder out/full/mlm/mlm.pth --out out/full/decision --log_dir out/full/decision/logs --save_optimizer --no_swanlab
+```
 
-2. **There is a VRAM cliff around 7.5–8 GB where nothing crashes.** Windows WDDM pages
-   to shared memory instead of raising OOM: measured, a 32×1024 batch does **not** OOM,
-   it just gets **10× slower** (297 ms → 5936 ms per step). So the budget here is
-   **peak < 6.5 GB**, not "fits in 8 GB", and `peak_vram_warn()` shouts when you cross
-   it — because the alternative explanation for a mysteriously slow run, absent that
-   warning, is "my code is slow."
+Load the pretrained encoder, initialize a new decision head, and **update both together**. Training defaults to a candidate sampling cap of 32. Score keeps all levels, and evaluation uses all candidates. Batching groups examples by candidate count and length to reduce padding.
 
-Do **not** copy MiniMind's default batch sizes (32/8) onto an 8 GB card. You will get a
-mysteriously slow run, not an error.
+| Parameter | MLM default | Decision default | Meaning |
+|---|---:|---:|---|
+| `hidden_size` / `num_hidden_layers` | 512 / 8 | 512 / 8 | Must match across stages |
+| `batch_size` | 16 | 16 | Reduce first if VRAM is tight |
+| `max_len` | 512 | 1024 | Decision inputs also contain questions and candidates |
+| `epochs` | 8 | 3 | Complete passes through the dataset |
+| `learning_rate` | 0.001 | 0.0005 | With warmup and cosine decay |
+| `accum` | 1 | 1 | Microbatches per accumulated update |
 
----
+`--use_checkpoint` trades compute for activation memory. Increasing `--accum` can compensate for a smaller batch size, but does not guarantee identical behavior. Check each script's `--help` for other options.
 
-## Environment
+### 💾 Step 7 · Save and resume
 
-Measured on: Python 3.12, torch 2.6.0+cu124, RTX 4070 Laptop (8188 MiB), bf16.
+Regular `.pth` files store inference weights, model configuration, and metadata. With `--save_optimizer`, separate `*_opt.pth` files also store the optimizer, scaler, epoch, next batch position, and random states.
 
-Throughput depends heavily on your hardware. `train_mlm.py` prints tok/s every
-`--log_interval` specifically so you can recompute the wall-clock on your own machine
-rather than trusting any number in this file.
+Resume the default decision run above:
 
----
+```shell
+python trainer/train_decision.py --tokenizer out/full/tokenizer --data out/full/synth --resume out/full/decision/decision_opt.pth --out out/full/decision --log_dir out/full/decision/logs --save_optimizer --no_swanlab
+```
 
-## License
+Keep the original data, tokenizer, training settings, and total `epochs`. `--max_steps N` saves and stops at total step N; remove that limit to continue the original schedule. MLM also supports `--resume`. Older files without complete state are rejected rather than treated as exact resumes.
 
-Apache-2.0. See [LICENSE](LICENSE).
+<a id="loss"></a>
+## 📉 V · What losses are we training?
+
+### Start with actual training curves
+
+![Historical MLM and decision losses, with validation NLL](assets/readme/training.png)
+
+These plots read historical training logs: MLM reaches 66,000 steps and decision training reaches 33,750. Faint lines show logged batch losses; bold lines show trailing means over 21 records. The right panel shows validation NLL. A restart in the log is separated out, retaining only the final run. Task and candidate-count differences cause loss fluctuations, so a downward training curve alone does not establish generalization.
+
+**The decision run predates the ordinal-loss repair. It is a historical process record, not a benchmark for the current code.** The [numeric snapshot and plotting notes](assets/readme/README.md) are included in the repository. The following formulas describe the current implementation.
+
+### 1. MLM: recover masked tokens
+
+MLM applies span masking to approximately 15% of positions. Of selected positions, approximately 80% become `<mask>`, 10% become random tokens, and 10% stay unchanged. Special tokens are excluded.
+
+$$
+\mathcal L_{\mathrm{MLM}}=-\frac{1}{|M|}\sum_{j\in M}\log P_\theta(x_j\mid\widetilde{x})
+$$
+
+Here $M$ is the selected position set and $\widetilde{x}$ is the corrupted input. Cross-entropy is computed only at those positions. This teaches contextual representations, not business decisions.
+
+### 2. Decision training: learn the candidate distribution
+
+Let $p$ be the prediction, $t$ the target, and $K$ the number of candidates:
+
+$$
+\mathcal L_{\mathrm{CE}}=-\sum_{i=1}^{K}t_i\log p_i,\qquad
+\mathcal L_{\mathrm{Brier}}=\sum_{i=1}^{K}(p_i-t_i)^2
+$$
+
+- **CE:** assign probability mass to candidates supported by the target.
+- **Brier:** penalize squared differences between predicted and target distributions. It is not divided by K by default; `--brier_normalize` enables that comparison.
+- **Ordinal term:** only for Score. It uses distances between grades, distinguishing a one-level error from a four-level error.
+
+For Score, first sort actual grades as $l_1<\cdots<l_K$ and form cumulative probabilities $F_p(j)=\sum_{i\le j}p_i$:
+
+$$
+\mathcal L_{\mathrm{ord}}=
+\frac{\sum_{j=1}^{K-1}(l_{j+1}-l_j)\,[F_p(j)-F_t(j)]^2}
+{l_K-l_1}
+$$
+
+Candidates may appear in shuffled order; the ordinal term still sorts by `meta.level` and excludes padding. The batch objective is:
+
+$$
+\mathcal L=\operatorname{mean}_{B}(\mathcal L_{\mathrm{CE}})
++0.5\operatorname{mean}_{B}(\mathcal L_{\mathrm{Brier}})
++0.5\operatorname{mean}_{B_{\mathrm{Score}}}(\mathcal L_{\mathrm{ord}})
+$$
+
+Omit the final term when a batch contains no Score examples. Set the weights with `--lambda_brier` and `--lambda_ord`.
+
+**A useful distinction:** hard-label cross-entropy and Brier can also learn conditional probabilities. Soft targets make distribution errors easier to inspect here; they do not guarantee calibration. With soft targets, this project's `brier` is squared distribution distance. Expected Brier against an observed label additionally includes $1-\sum_i t_i^2$. See [calibration notes](docs/CALIBRATION.md).
+
+### 3. Temperature calibration: adjust probability sharpness
+
+Freeze the model and fit a positive temperature $T$ by minimizing NLL on the separate `calib` split:
+
+$$
+p_i^{(T)}=\operatorname{softmax}(z/T)_i
+$$
+
+$T>1$ makes distributions flatter; $T<1$ makes them sharper. The script compares global, per-primitive, and primitive×candidate-count temperatures. Temperature scaling does not correct candidate rankings or replace learning the task.
+
+<a id="evaluation"></a>
+## 📊 VI · Evaluation: correct, or merely confident?
+
+### Existing experiments: look at the gap first
+
+![Historical synthetic versus public-text results and temperature calibration ECE](assets/readme/evaluation.png)
+
+The historical model performs better on synthetic held-out data, while NLL and distribution error increase on public real text. These datasets differ in tasks, candidate counts, and target distributions, so this is not a controlled comparison. It illustrates why synthetic results do not establish real-task competence. The right panel compares ECE before and after calibration on the same synthetic test set; lower ECE does not imply higher accuracy.
+
+<details>
+<summary><b>Expand: historical small-sample comparison with Jev / DeepSeek APIs</b></summary>
+
+![Historical exploratory API comparison on 48 synthetic examples](assets/readme/api-comparison.png)
+
+This experiment sampled 8 examples per synthetic task, 48 total, with at most 8 candidates. MiniSystemOne and Jev each returned 48 valid outputs. DeepSeek returned 37 valid outputs, with 11 parse failures excluded from quality metrics. These bars are not a shared-sample fair ranking and do not support a broad superiority claim. The summary does not record API model versions; local inference and network latency are not directly compared in the figure.
+
+</details>
+
+These are historical experiments from before the repairs; full evaluation of a retrained model remains outstanding. All experimental charts are plotted programmatically from records. The header illustration is AI-generated and conceptual. Run `python scripts/make_readme_figures.py` to redraw from the committed numeric snapshot; see [sources and the image-generation prompt](assets/readme/README.md).
+
+### 1. Calibration and synthetic held-out testing
+
+```shell
+python trainer/calibrate_temperature.py --tokenizer out/full/tokenizer --ckpt out/full/decision/decision.pth --data out/full/synth --out out/full/calibration
+python eval/eval_harness.py --tokenizer out/full/tokenizer --ckpt out/full/decision/decision.pth --data out/full/synth --sets test_known --temperature out/full/calibration/T.json --out out/full/eval
+python eval/make_reliability_plot.py --eval out/full/eval/decision --sets test_known --out out/full/plots
+```
+
+If VRAM is limited, add `--batch_size 2` to the first two commands. Report filenames contain the dataset directory name, for example `out/full/eval/decision/synth_test_known.json`.
+
+| Metric | Question | Interpretation |
+|---|---|---|
+| `accuracy` | Does the prediction match the target argmax? | Ties in soft targets depend on tie-breaking |
+| `accuracy_soft` | What target probability does the selected candidate receive? | Accuracy for hard labels; expected correctness for soft targets |
+| `nll` | Is enough probability assigned to target-supported answers? | Lower is better |
+| `brier` | How far is the prediction from the target distribution? | Squared distribution distance in this implementation |
+| `ece` | Does confidence match correctness within bins? | Lower is better, but insufficient alone |
+| `ordinal_mae` | How far must rating probability mass move to match the target? | Wasserstein-1 distance in grade units |
+| `expected_score_mae` | How large is the expected-rating error? | Score only |
+
+Inspect results by `source` and `provenance` before aggregates. The historical field `calibration` denotes the distribution-target subset excluding `hard`; it does not mean hard labels cannot evaluate calibration.
+
+### 2. Test on real text
+
+```shell
+python scripts/build_dataset.py --public --tokenizer out/full/tokenizer --out out/full/public
+python eval/eval_harness.py --tokenizer out/full/tokenizer --ckpt out/full/decision/decision.pth --data out/full/public --sets test_known --batch_size 2 --out out/full/eval_public
+python eval/make_reliability_plot.py --eval out/full/eval_public/decision --sets test_known --source public:chaosnli --out out/full/plots_public
+```
+
+Report raw probabilities first instead of automatically applying temperatures fitted on synthetic data. Although named `test_known`, the public split is a cross-domain test for a model trained only on synthetic tasks. If continuing training on public data, retain independent calibration and test sets and disclose the changed training sources.
+
+### 3. Test unseen task families
+
+```shell
+python scripts/build_dataset.py --tokenizer out/full/tokenizer --out out/full/synth_ood --ood_generators calendar_slot security_gate
+```
+
+This reserves those entire generators for `test_ood`. For a task-family generalization experiment, **retrain the decision model** on `out/full/synth_ood/train.jsonl`, then evaluate its `test_ood`. A full-data model already trained on those generators cannot establish this claim. To claim the entire pipeline never saw these tasks, exclude them from tokenizer/MLM corpora too; default synthetic pretraining text does not provide that isolation.
+
+### 4. Speed, memory, and code correctness
+
+```shell
+python eval/eval_efficiency.py --tokenizer out/full/tokenizer --ckpt out/full/decision/decision.pth --data out/full/synth --out out/full/efficiency
+python -m unittest discover -s tests -v
+python scripts/smoke_test.py --device cpu --skip_big
+```
+
+Read efficiency separately from task quality. Candidate count, state length, batch size, tokenization, and packing affect end-to-end latency. Architecture tests cover candidate permutation, chunking, and prefix isolation; regression tests cover ordinal calculations, truncation, abstention, inference, and resuming. See the [detailed quick start](docs/QUICKSTART.md) for enabling GPU resume-equivalence tests.
+
+<a id="custom-task"></a>
+## 🎯 VII · Train on your own task
+
+For a customer-support tool router:
+
+1. **Define the choices.** Specify each option and when human review applies. Model independent judgments that can both be true as separate Noul questions.
+2. **Prepare examples.** Record real requests, candidates, and labels in the JSONL format above. Include varied phrasing, missing information, and easily confused requests.
+3. **Separate the data.** Create `train.jsonl`, `val.jsonl`, `calib.jsonl`, and `test_known.jsonl` under `dataset/my_task/`. Split by conversation, user, or template to avoid paraphrase leakage.
+4. **Train and evaluate.** Inspect validation errors, fit temperatures on calibration data, then report final results on the test set.
+5. **Connect the application.** Call `DecisionPredictor` with consistent candidate names. Choose routing thresholds on validation data and track coverage and error rate.
+
+Using the encoder and tokenizer from the full walkthrough:
+
+```shell
+python trainer/train_decision.py --tokenizer out/full/tokenizer --data dataset/my_task --encoder out/full/mlm/mlm.pth --out out/my_task --log_dir out/my_task/logs --save_optimizer --no_swanlab
+python trainer/calibrate_temperature.py --tokenizer out/full/tokenizer --data dataset/my_task --ckpt out/my_task/decision.pth --out out/my_task/calibration
+python eval/eval_harness.py --tokenizer out/full/tokenizer --data dataset/my_task --ckpt out/my_task/decision.pth --sets test_known --temperature out/my_task/calibration/T.json --out out/my_task/eval
+```
+
+In the routing example, set the checkpoint to `out/my_task/decision.pth` and tokenizer to `out/full/tokenizer`. To apply its temperatures, construct `DecisionPredictor` with `calibration="out/my_task/calibration/T.json"`.
+
+<a id="code-map"></a>
+## 🧭 VIII · Suggested code-reading order
+
+| Order | File | Start by understanding |
+|---:|---|---|
+| 1 | [train_tokenizer.py](trainer/train_tokenizer.py) | How text becomes tokens |
+| 2 | [serialize.py](model/serialize.py) | Input layout, segments, masks, and candidate spans |
+| 3 | [model_system_one.py](model/model_system_one.py) | Encoder, pooling, scoring, and losses |
+| 4 | [decision_dataset.py](dataset/decision_dataset.py) | Truncation, candidate sampling, and batching |
+| 5 | [train_mlm.py](trainer/train_mlm.py) / [train_decision.py](trainer/train_decision.py) | Optimizers and training loops |
+| 6 | [eval_metrics.py](eval/eval_metrics.py) / [calibrate_temperature.py](trainer/calibrate_temperature.py) | Measuring probabilities and calibrating them |
+| 7 | [inference.py](model/inference.py) / [decide.py](scripts/decide.py) | Connecting the model to a task |
+
+Further reading: [architecture](docs/DESIGN.md) · [data schema](docs/DATA_SCHEMA.md) · [calibration](docs/CALIBRATION.md) · [detailed quick start](docs/QUICKSTART.md).
+
+## 💡 FAQ
+
+**Can it answer arbitrary questions like a chat model?** No. Its scope is contextual decisions over candidates, and its capabilities depend on training data. Valid probabilities and valid output formatting do not establish correctness.
+
+**Why use MLM first?** It supplies text representations. Use `--encoder=` to train decisions from random weights as an ablation of pretraining's value, rather than assuming pretraining always helps.
+
+**Can I train on CPU?** Both current training entry points require CUDA. CPU supports inference, parameter counting, and basic tests. Start with the small route to check your environment.
+
+**Are there limitations on candidate changes?** Candidates are scored independently by default, which suits checking each option against evidence. Tasks such as choosing the median of the current candidate set require relationships between candidates that this structure cannot directly express.
+
+**How can I reduce VRAM use?** Reduce `--batch_size` first, then consider sequence length and `--use_checkpoint`. On Windows, memory pressure may cause severe slowdown before an OOM error appears.
+
+**I just want to try it quickly.** Generate small weights with the quick start, then run `scripts/decide.py`. If you already have matching trained weights and a tokenizer, call inference directly. Keep tokenizers, weights, and temperatures matched to the same run.
+
+## 🙏 Acknowledgments and license
+
+Thanks to [MiniMind](https://github.com/jingyaogong/minimind) for inspiring accessible training-from-scratch tutorials, and to the public dataset authors. The decision interface draws inspiration from [TypeSafe's Jev introduction](https://typesafe.ai/blog/introducing-system-one-models-and-jev). For probabilistic scoring theory, see [Gneiting and Raftery](https://www.eecs.harvard.edu/cs286r/courses/fall10/papers/Gneiting07.pdf).
+
+Code is licensed under [Apache-2.0](LICENSE). Consult each external dataset for its own license and usage terms.

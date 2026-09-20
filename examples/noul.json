@@ -1,0 +1,5 @@
+{
+  "state": "The account is active. The identity check passed. Policy: active accounts with a passed identity check may proceed.",
+  "question": "May this account proceed?",
+  "primitive": "noul"
+}

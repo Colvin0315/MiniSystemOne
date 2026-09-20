@@ -21,11 +21,9 @@ import torch
 
 # ---------------------------------------------------------------------------
 def get_lr(current_step, total_steps, lr):
-    """MiniMind 的余弦退火：0.1 起步、0.55 封顶。
+    """余弦衰减：step=0 为 lr，半程为 0.55*lr，末端为 0.1*lr。
 
-    `lr` 参数是**峰值**，实际峰值是 `0.55 * lr` —— 因为 `0.1 + 0.45*(1+cos)` 在
-    cos=1（末步）时为 0.1，在 cos=-1（半程）时为 0.55。这个不直观的缩放是
-    MiniMind 的既有约定，保留它以免和参考实现的学习率对不上。
+    调用方另乘线性 warmup，因此实际峰值还取决于 warmup 时长。
     """
     import math
     return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / max(total_steps, 1))))
@@ -236,7 +234,7 @@ def init_model(model_cls, config, checkpoint=None, device="cuda", strict=False):
 
 
 def save_checkpoint(model, path, optimizer=None, scaler=None, step=0,
-                    config=None, meta=None):
+                    config=None, meta=None, training_state=None):
     """两件事分开写在两个文件里，因为它们用途不同。
 
     只存半精度权重（`{name}.pth`）给推理/评测用；完整状态（含优化器动量，约 3 倍
@@ -263,11 +261,14 @@ def save_checkpoint(model, path, optimizer=None, scaler=None, step=0,
     torch.save(blob, tmp)
     os.replace(tmp, path)
     if optimizer is not None:
+        from trainer.training_state import capture_rng
         opt_path = path.replace(".pth", "_opt.pth")
         tmp = opt_path + ".tmp"
-        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "scaler": scaler.state_dict() if scaler is not None else None,
-                    "step": step}, tmp)
+        opt_blob = dict(blob, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                        scaler=scaler.state_dict() if scaler is not None else None, step=step)
+        if training_state is not None:
+            opt_blob['training_state'] = dict(training_state, rng=capture_rng())
+        torch.save(opt_blob, tmp)
         os.replace(tmp, opt_path)
 
 

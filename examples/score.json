@@ -1,0 +1,7 @@
+{
+  "state": "An agent completed the requested task and passed all checks. Grade 1 means failed, 2 means partial completion, 3 means complete success.",
+  "question": "What grade should this run receive?",
+  "primitive": "score",
+  "candidates": ["complete success", "failed", "partial completion"],
+  "levels": [3, 1, 2]
+}

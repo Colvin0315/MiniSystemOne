@@ -55,12 +55,9 @@ def fit_state(sections, budget, tokenizer, trunc_id, nl_ids):
     #    变成空串：模型连问题在问什么都无从判断，那比截断更糟。剩下的交给 ②。
     kept = list(range(len(enc)))
     for i in sorted(range(len(enc)), key=lambda j: enc[j][0]):
-        if len(kept) == 1:
+        if len(render(kept)) <= budget or len(kept) == 1:
             break
-        trial = [k for k in kept if k != i]
-        if len(render(trial)) <= budget:
-            break
-        kept = trial
+        kept = [k for k in kept if k != i]
 
     ids = render(kept)
     # ② 留下的段仍然超预算：头尾切片（近期偏置 —— 当前处境在末尾）
@@ -205,7 +202,7 @@ class DecisionDataset(Dataset):
         for i in order:
             ids = encode_text(self.tok, cands[i]["text"]) or [self.sep_id]
             cand_ids.append(ids)
-            levels.append(-1 if levels_full[i] is None else int(levels_full[i]))
+            levels.append(-1 if levels_full[i] is None else float(levels_full[i]))
 
         question_ids = encode_text(self.tok, rec["question"])
 

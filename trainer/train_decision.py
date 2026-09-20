@@ -7,8 +7,8 @@ Stage 2：决策训练。`L = CE + λ_b·Brier + is_ord·λ_o·CDF-MSE`。
 
 `provenance` 决定这份分布从哪来（`explicit_rng` 的银行 RNG、`tie_set` 的并列集、
 `marginalized` 的边缘化），而 `hard` 的目标是 one-hot —— 它在 DATA_SCHEMA 里被
-排除在**所有校准指标**之外，因为它里面没有任何关于"世界有多不确定"的信息，
-拿它算 ECE 只会把整体数字稀释得好看。所以训练用的 val 上同时报两套：
+从历史 `calibration` 子集里排除，以单列分布目标实验；硬标签同样能用于学习概率和
+计算 ECE，混合指标则取决于指定的数据分布。训练用的 val 上同时报两套：
 全部样本、以及剔除 hard 的 `calibration` 子集。
 
 另外三条不显然但重要的约定：
@@ -45,8 +45,9 @@ from eval.eval_metrics import metrics_by_provenance
 from model.model_system_one import DecisionConfig, MiniSystemOneForDecision
 from trainer.trainer_utils import (
     Logger, data_manifest, file_sha1, get_lr, init_model, peak_vram_warn,
-    save_checkpoint, unbuffer_stdout,
+    save_checkpoint, unbuffer_stdout, verify_tokenizer,
 )
+from trainer.training_state import seed_all, restore_training, resume_signature, accumulation_size
 
 
 def parse_args():
@@ -84,6 +85,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--use_checkpoint", action="store_true")
     p.add_argument("--save_optimizer", action="store_true")
+    p.add_argument("--resume", default=None, help="从新版 decision_opt.pth 恢复完整训练状态")
+    p.add_argument("--max_steps", type=int, default=0, help="本次运行到指定总 step 后保存退出；0=跑完")
     p.add_argument("--no_swanlab", action="store_true")
     p.add_argument("--smoke", action="store_true")
     return p.parse_args()
@@ -131,7 +134,12 @@ def main():
         # 生产路径接 `train_mlm.py` 的产物。显式传 `--encoder ''` 不受影响。
         args.encoder = ("out/mlm_smoke/mlm.pth" if args.smoke else "out/mlm/mlm.pth")
 
-    torch.manual_seed(args.seed)
+    if min(args.epochs, args.batch_size, args.accum) < 1 or args.max_steps < 0:
+        raise SystemExit("epochs / batch_size / accum 必须为正，max_steps 不得为负")
+    if args.resume and not os.path.isfile(args.resume):
+        raise SystemExit(f"续训文件不存在：{args.resume}")
+    seed_all(args.seed)
+    os.makedirs(args.out, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         raise SystemExit("本项目的所有实测数字都基于 GPU；--device cpu 不在支持范围内。")
@@ -154,10 +162,17 @@ def main():
     print(f"  calib split **不在此读取** —— 它只用于温度校准（见 calibrate_temperature.py）")
 
     sampler = CandidateBucketSampler(ds_train, args.batch_size, shuffle=True, seed=args.seed)
+    loader_rng = torch.Generator()
     loader = DataLoader(ds_train, batch_sampler=sampler, collate_fn=collate_decision,
-                        num_workers=args.num_workers)
-    steps_per_epoch = max(1, len(loader) // args.accum)
-    total_steps = steps_per_epoch * args.epochs
+                        num_workers=args.num_workers, generator=loader_rng)
+    epoch_batches = []
+    for ep in range(args.epochs):
+        sampler.set_epoch(ep)
+        epoch_batches.append(len(loader))
+    sampler.set_epoch(0)
+    if not all(epoch_batches):
+        raise SystemExit("训练数据不足以构成 batch；减小 batch_size")
+    total_steps = sum((n + args.accum - 1) // args.accum for n in epoch_batches)
 
     print("\n========== 2. 模型 ==========")
     config = DecisionConfig(
@@ -167,10 +182,12 @@ def main():
         pad_token_id=tok.convert_tokens_to_ids("<pad>"),
         sep_token_id=tok.convert_tokens_to_ids("<sep>"),
     )
-    ckpt = args.encoder or None
+    ckpt = args.resume or args.encoder or None
     if ckpt and not os.path.exists(ckpt):
         raise SystemExit(f"--encoder {ckpt} 不存在；要从随机初始化训练请显式传 --encoder ''")
-    model = init_model(MiniSystemOneForDecision, config, ckpt, device)
+    if ckpt:
+        verify_tokenizer(ckpt, args.tokenizer)
+    model = init_model(MiniSystemOneForDecision, config, ckpt, device, strict=bool(args.resume))
     n_param = sum(p.numel() for p in model.parameters())
     print(f"  参数 {n_param/1e6:.2f}M  "
           f"crosstalk={args.crosstalk}  prefix_blocked={config.prefix_blocked}")
@@ -188,6 +205,7 @@ def main():
         "epochs": args.epochs,
         "encoder_init": os.path.basename(ckpt) if ckpt else "random",
         "trained_on": os.path.basename(os.path.normpath(args.data)),
+        "training_revision": "ordinal-levels-v2",
     }
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,
@@ -197,18 +215,33 @@ def main():
     except (AttributeError, TypeError):
         scaler = torch.cuda.amp.GradScaler(enabled=True)
     logger = Logger(args.log_dir, name="decision", use_swanlab=not args.no_swanlab)
+    signature = resume_signature(args, dict(train=file_sha1(train_path), val=file_sha1(val_path),
+                                tokenizer=file_sha1(os.path.join(args.tokenizer, "tokenizer.json"))))
+    progress = dict(epoch=0, next_batch=0, signature=signature)
+    start_step = 0
+    if args.resume:
+        progress = restore_training(args.resume, model, opt, scaler, signature)
+        start_step = progress['step']
+        print(f"  续训 step={start_step}, epoch={progress['epoch']}, next_batch={progress['next_batch']}")
 
     print("\n========== 3. 训练 ==========")
-    print(f"  每 epoch {steps_per_epoch} step，共 {total_steps} step")
+    print(f"  每 epoch batch 数 {epoch_batches}，共 {total_steps} optimizer step")
     print(f"  loss = CE + {args.lambda_brier}·Brier"
           f"{f' / K' if args.brier_normalize else ''}"
           f" + is_ord·{args.lambda_ord}·CDF-MSE")
-    best = None
-    step, t0 = 0, time.time()
+    step, t0 = start_step, time.time()
     model.train()
-    for epoch in range(args.epochs):
+    start_epoch, start_batch = progress['epoch'], progress['next_batch']
+    stop = bool(args.max_steps and step >= args.max_steps)
+    for epoch in range(start_epoch, args.epochs):
+        if stop:
+            break
         sampler.set_epoch(epoch)
+        loader_rng.manual_seed(args.seed + epoch)
+        n_batches = len(loader)
         for micro, batch in enumerate(loader):
+            if epoch == start_epoch and micro < start_batch:
+                continue
             batch = {k: (v.to(device) if torch.is_tensor(v) else v)
                      for k, v in batch.items()}
             cur_lr = get_lr(step, total_steps, args.learning_rate)
@@ -221,12 +254,13 @@ def main():
                     batch["input_ids"], seg_id=batch["seg_id"], cand_id=batch["cand_id"],
                     cand_span=batch["cand_span"], cand_mask=batch["cand_mask"],
                     target=batch["target"], is_ord=batch["is_ord"],
+                    level_idx=batch["level_idx"], brier_normalize=args.brier_normalize,
                     lambda_brier=args.lambda_brier, lambda_ord=args.lambda_ord,
                 )
-                loss = out.loss / args.accum
+                loss = out.loss / accumulation_size(micro, n_batches, args.accum)
             scaler.scale(loss).backward()
 
-            if (micro + 1) % args.accum:
+            if (micro + 1) % args.accum and micro + 1 != n_batches:
                 continue
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -234,6 +268,9 @@ def main():
             scaler.update()
             opt.zero_grad(set_to_none=True)
             step += 1
+            progress = dict(epoch=epoch + int(micro + 1 == n_batches),
+                            next_batch=0 if micro + 1 == n_batches else micro + 1,
+                            signature=signature)
 
             if step % args.log_interval == 0:
                 d = {"step": step, "epoch": epoch, "lr": cur_lr,
@@ -261,11 +298,14 @@ def main():
             if args.save_interval and step % args.save_interval == 0:
                 save_checkpoint(model, os.path.join(args.out, "decision.pth"),
                                 opt if args.save_optimizer else None, scaler, step,
-                                config=config, meta=ckpt_meta)
+                                config=config, meta=ckpt_meta, training_state=progress)
+            if args.max_steps and step >= args.max_steps:
+                stop = True
+                break
 
     save_checkpoint(model, os.path.join(args.out, "decision.pth"),
                     opt if args.save_optimizer else None, scaler, step,
-                    config=config, meta=ckpt_meta)
+                    config=config, meta=ckpt_meta, training_state=progress)
     res = evaluate(model, ds_val, device, args.val_limit, args.batch_size)
     if res:
         with open(os.path.join(args.out, "val_last.json"), "w", encoding="utf-8") as f:

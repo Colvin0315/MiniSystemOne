@@ -1,10 +1,9 @@
 """
 纯函数指标库 —— 无模型、无 I/O，输入输出都是 numpy。
 
-**所有指标按 `provenance` 分桶报告，`hard` 一律排除在校准指标之外。** 理由不是
-洁癖：`explicit_rng`、`marginalized`、`tie_set`、`human_annotators` 四种来源的
-**不可约噪声底不同**。把 `hard`（贝叶斯上界就是 100% 正确）和 `tie_set`（上界是
-均匀分布）混进同一个 ECE，得到的数字既不是模型性质也不是数据性质，只是混合比例。
+所有指标按 `provenance` 分桶报告。历史 `calibration` 子集排除 `hard`，用于单列
+分布目标实验，并非硬标签无法评测校准。混合 ECE 对指定的混合分布有意义，但可能
+掩盖子群失准；同时报告来源、数量和分层结果。
 `metrics_by_provenance` 是唯一对外的主入口，`compute_metrics` 只是它的零件。
 
 几个刻意的选择：
@@ -14,9 +13,8 @@
   好。equal-mass 保证每个桶样本数相当，尾部也能被独立看到。
 - **软目标的"正确率"取 `t[argmax p]`**，而不是 `1[argmax p == argmax t]`。前者是
   软标签的正确推广（t 是 one-hot 时两者一致），也是噪声地板能对上的口径。
-- **`binomial_noise_floor` 是一等函数，不是脚注。** ChaosNLI 每条约 100 个标注者，
-  p̂=0.5 的标准误约 0.05，所以**逐条 ECE 在原理上测不到 0.05 以下**。报告"ECE=0.03"
-  而不报同标注数下的地板，等于把标注噪声当成了模型的优点。
+- **`binomial_noise_floor`** 模拟有限标注人数带来的抽样波动。单条比例的标准误
+  不是分桶 ECE 的硬下限；历史 `ece_corrected` 的直接相减只是启发式诊断，非无偏估计。
 """
 import numpy as np
 
@@ -128,10 +126,10 @@ def nll(p, t, mask=None):
 
 
 def brier(p, t, mask=None, normalize=False):
-    """**不归一化**的 Brier（方案要求）。
+    """Squared distance to target distribution (historical field name).
 
-    除以 K 会让大 K 处的这一项几乎消失 —— 而大 K 正是最需要它的地方
-    （候选越多，"每个候选都报 1/K"这种懒策略越接近正确，越需要被惩罚）。
+    For soft t this is excess expected Brier. Expected observed-label Brier
+    adds 1-sum(t**2); for one-hot targets the two coincide.
     """
     p = mask_normalize(p, mask)
     t = np.asarray(t, dtype=np.float64)
@@ -262,15 +260,27 @@ def expected_score(p, levels, mask=None):
 
 
 def ordinal_mae(p, t, levels=None, mask=None):
-    """0.5 · Σ|CDF_p − CDF_t| —— CDF 形式对序数距离更敏感（方案指定）。
+    """Wasserstein-1 distance in grade units (MAE for point distributions).
 
-    levels 只用于给出 MAE 的量纲（等级数）；纯 CDF 版本不需要它。
+    Sort by explicit levels, not presentation order. If omitted, columns are
+    assumed to already be consecutive increasing levels. Historical versions
+    ignored levels and multiplied by 0.5; those results are not comparable.
     """
     p = mask_normalize(p, mask)
     t = mask_normalize(t, mask)
-    cdf_p = np.cumsum(p, -1)[..., :-1]
-    cdf_t = np.cumsum(t, -1)[..., :-1]
-    return float((0.5 * np.abs(cdf_p - cdf_t).sum(-1)).mean())
+    valid = np.ones_like(p, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    lv = np.broadcast_to(np.arange(p.shape[-1]) if levels is None else np.asarray(levels), p.shape)
+    if not np.isfinite(lv[valid]).all():
+        raise ValueError("Score levels must be finite")
+    order = np.argsort(np.where(valid, lv, np.inf), axis=-1)
+    sorted_lv = np.take_along_axis(lv, order, -1)
+    sorted_mask = np.take_along_axis(valid, order, -1)
+    edges = sorted_mask[:, :-1] & sorted_mask[:, 1:]
+    gaps = np.diff(sorted_lv, axis=-1)
+    if np.any(valid.sum(-1) < 2) or np.any(gaps[edges] <= 0):
+        raise ValueError("Score requires at least two distinct levels")
+    delta = np.cumsum(np.take_along_axis(p - t, order, -1), -1)[:, :-1]
+    return float((np.abs(delta) * np.where(edges, gaps, 0)).sum(-1).mean())
 
 
 # ---------------------------------------------------------------------------
@@ -283,17 +293,22 @@ def risk_coverage_curve(p, t, mask=None, abstain_idx=None):
     熵阈值规则只是事后补充的画图手段）。
     """
     idx, conf = top1(p, mask)
-    correct = (idx == np.asarray(t).argmax(-1)).astype(np.float64)
+    correct = soft_accuracy(p, t, mask)
     if abstain_idx is not None:
         keep = idx != abstain_idx
     else:
         keep = np.ones_like(conf, dtype=bool)
-    order = np.argsort(-conf)
-    ks = np.arange(1, len(order) + 1)
-    hit = correct[order].cumsum()
-    cov = np.where(keep[order].cumsum() > 0, ks / len(order), 0.0)
+    accepted = np.flatnonzero(keep)
+    if not len(accepted):
+        return (np.array([], dtype=float),) * 3
+    order = accepted[np.argsort(-conf[accepted], kind="stable")]
+    # A threshold accepts all examples with the same confidence at once.
+    end = np.r_[np.flatnonzero(np.diff(conf[order]) != 0), len(order) - 1]
+    ks = end + 1
+    hit = correct[order].cumsum()[end]
+    cov = ks / len(idx)
     risk = 1.0 - hit / ks
-    thr = conf[order]
+    thr = conf[order][end]
     return cov, risk, thr
 
 
@@ -323,7 +338,8 @@ def compute_metrics(p, t, mask=None, provenance=None, is_ord=None, levels=None,
         out["ece_corrected"] = max(0.0, out["ece"] - out["ece_noise_floor"])
     if is_ord is not None and np.any(is_ord):
         sel = np.asarray(is_ord, dtype=bool)
-        out["ordinal_mae"] = ordinal_mae(p[sel], t[sel], levels, None if mask is None else mask[sel])
+        ord_levels = levels[sel] if levels is not None and np.ndim(levels) == 2 else levels
+        out["ordinal_mae"] = ordinal_mae(p[sel], t[sel], ord_levels, None if mask is None else mask[sel])
         if levels is not None:
             es_p = expected_score(p[sel], levels[sel] if np.ndim(levels) == 2 else levels, mask[sel] if mask is not None else None)
             es_t = (mask_normalize(t[sel], None if mask is None else mask[sel])
@@ -353,8 +369,8 @@ def metrics_by_provenance(p, t, mask=None, provenance=None, **kw):
     """按 provenance 分桶 + 一个 `all` 总桶。**这是对外的主入口。**
 
     `all` 桶同时给出两份：`all`（全部样本）和 `calibration`（剔除 `hard`）。
-    后者才是能拿去和论文比的那个 —— 前者混进了贝叶斯上界为 100% 的样本，
-    会把 ECE 稀释得很好看。
+    后者是本项目约定的分布目标子集，不表示前者无效。跨实验比较还需对齐来源、
+    分桶、样本量和标签口径。
 
     注意 `hard` 与 `calibration` **不是互斥的两类**：`calibration` 是
     `explicit_rng ∪ marginalized ∪ tie_set ∪ human_annotators` 的并集，所以在

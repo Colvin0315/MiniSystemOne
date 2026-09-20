@@ -1,0 +1,6 @@
+{
+  "state": "The user asks to check their account balance. Available tools: balance_lookup retrieves the balance; transfer_funds moves money.",
+  "question": "Which tool matches the user's request?",
+  "primitive": "choice",
+  "candidates": ["balance_lookup", "transfer_funds", "abstain"]
+}
