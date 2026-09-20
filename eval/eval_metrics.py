@@ -1,30 +1,19 @@
 """
-纯函数指标库 —— 无模型、无 I/O，输入输出都是 numpy。
+纯 NumPy 指标库。硬标签和软标签都可计算 proper scores 与分桶 top-label ECE。
 
-**所有指标按 `provenance` 分桶报告，`hard` 一律排除在校准指标之外。** 理由不是
-洁癖：`explicit_rng`、`marginalized`、`tie_set`、`human_annotators` 四种来源的
-**不可约噪声底不同**。把 `hard`（贝叶斯上界就是 100% 正确）和 `tie_set`（上界是
-均匀分布）混进同一个 ECE，得到的数字既不是模型性质也不是数据性质，只是混合比例。
-`metrics_by_provenance` 是唯一对外的主入口，`compute_metrics` 只是它的零件。
-
-几个刻意的选择：
-
-- **ECE 默认 equal-mass 分桶。** 等宽分桶在过度自信的尾部会退化 —— 小模型把大量
-  样本堆在 0.9–1.0 这个桶里，桶数很少、每个桶很大，误差被平摊掉，ECE 显得比实际
-  好。equal-mass 保证每个桶样本数相当，尾部也能被独立看到。
-- **软目标的"正确率"取 `t[argmax p]`**，而不是 `1[argmax p == argmax t]`。前者是
-  软标签的正确推广（t 是 one-hot 时两者一致），也是噪声地板能对上的口径。
-- **`binomial_noise_floor` 是一等函数，不是脚注。** ChaosNLI 每条约 100 个标注者，
-  p̂=0.5 的标准误约 0.05，所以**逐条 ECE 在原理上测不到 0.05 以下**。报告"ECE=0.03"
-  而不报同标注数下的地板，等于把标注噪声当成了模型的优点。
+`distribution_l2` 是预测与给定目标分布的类别平方差之和，再跨样本平均；
+`expected_brier` 是相对于该目标分布抽取类别的期望 Brier。人工频率未必是真实条件分布。
+`soft_accuracy` 使用 t[argmax p]，one-hot 下自然退化为观测正确率。
+按 provenance 分组解释目标来源；混合总体也合法，但须说明组成。
+ECE 不是逐条分布准确性或 OOD 能力的证明。标注 Monte Carlo 参考量不是通用下界，
+不从观测 ECE 中相减。
 """
 import numpy as np
 
-CALIBRATION_PROVENANCE = ("explicit_rng", "marginalized", "tie_set", "human_annotators")
+SOFT_TARGET_PROVENANCE = ("explicit_rng", "marginalized", "tie_set", "human_annotators")
 HARD_PROVENANCE = ("hard",)
 
-# 温度校准与 ECE 分桶都按 (primitive, K) 分档：K=2 的二分类与 K=255 的多分类，
-# 其 logit 尺度天然不同，一个标量温度盖不住。
+# 温度按 (primitive, K) 分档；是否优于全局温度需在留出集实测。
 K_BUCKETS = ((2, 2), (3, 4), (5, 8), (9, 32), (33, 255))
 
 
@@ -93,16 +82,23 @@ def _temperature_vector(temp, granularity, primitive, k):
 # 基础量
 # ---------------------------------------------------------------------------
 def mask_normalize(p, mask=None):
-    """把已 mask 的槽位归零并重归一化，避免被 NEG_INF 之外的脏值污染。"""
+    """Zero masked slots and normalize each row; reject invalid distributions."""
     p = np.asarray(p, dtype=np.float64)
-    if mask is None:
-        return p
-    p = np.where(mask, p, 0.0)
-    return p / np.maximum(p.sum(-1, keepdims=True), 1e-12)
+    if p.ndim != 2 or p.shape[1] == 0:
+        raise ValueError("probabilities must have shape (N, K), K > 0")
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != p.shape:
+            raise ValueError("mask must match probabilities")
+        p = np.where(mask, p, 0.0)
+    mass = p.sum(-1, keepdims=True)
+    if not np.isfinite(p).all() or np.any(p < 0) or np.any(mass <= 0):
+        raise ValueError("each row needs finite nonnegative probabilities and positive mass")
+    return p / mass
 
 
 def top1(p, mask=None):
-    """返回 (预测下标, 置信度, 软正确率)。软正确率 = t[argmax p]，见模块注释。"""
+    """Return predicted indices and confidence after masking/normalization."""
     p = mask_normalize(p, mask)
     idx = p.argmax(-1)
     conf = p[np.arange(len(p)), idx]
@@ -110,34 +106,50 @@ def top1(p, mask=None):
 
 
 def accuracy(p, t, mask=None):
-    """硬准确率：argmax(p) == argmax(t)。软目标上它就是"命中最大概率那一项"。"""
+    """Argmax agreement; ties in the target use NumPy's first-index rule."""
     idx, _ = top1(p, mask)
-    return float((idx == np.asarray(t).argmax(-1)).mean())
+    return float((idx == mask_normalize(t, mask).argmax(-1)).mean())
 
 
 def soft_accuracy(p, t, mask=None):
-    """软正确率：命中项的**目标概率**，在 [0,1] 上连续。校准用这个口径。"""
+    """Per-row target probability of the prediction; hard labels give 0/1."""
     idx, _ = top1(p, mask)
-    return np.asarray(t, dtype=np.float64)[np.arange(len(idx)), idx]
+    return mask_normalize(t, mask)[np.arange(len(idx)), idx]
 
 
 def nll(p, t, mask=None):
     p = mask_normalize(p, mask)
-    t = np.asarray(t, dtype=np.float64)
+    t = mask_normalize(t, mask)
     return float(-(t * np.log(np.clip(p, 1e-12, None))).sum(-1).mean())
 
 
-def brier(p, t, mask=None, normalize=False):
-    """**不归一化**的 Brier（方案要求）。
+def _class_count(p, mask):
+    return p.shape[-1] if mask is None else np.asarray(mask, dtype=bool).sum(-1)
 
-    除以 K 会让大 K 处的这一项几乎消失 —— 而大 K 正是最需要它的地方
-    （候选越多，"每个候选都报 1/K"这种懒策略越接近正确，越需要被惩罚）。
+
+def distribution_l2(p, t, mask=None, normalize=False):
+    """Mean over rows of sum_k (p_k-t_k)^2 (not per-class MSE).
+
+    Optional normalize=True divides each row by its valid class count, including
+    K when no mask is supplied. Public metric reports use the unnormalized sum.
     """
-    p = mask_normalize(p, mask)
-    t = np.asarray(t, dtype=np.float64)
+    p, t = mask_normalize(p, mask), mask_normalize(t, mask)
     d = ((p - t) ** 2).sum(-1)
-    if normalize and mask is not None:
-        d = d / mask.sum(-1).clip(min=1)
+    if normalize:
+        d = d / _class_count(p, mask)
+    return float(d.mean())
+
+
+def expected_brier(p, t, mask=None, normalize=False):
+    """E_{Y~t}[sum_k (p_k-1[Y=k])^2], averaged over rows.
+
+    Equals distribution_l2 + mean(1-sum_k t_k^2). For one-hot targets
+    this is the observed multiclass Brier score, without an additive term.
+    """
+    p, t = mask_normalize(p, mask), mask_normalize(t, mask)
+    d = ((p - t) ** 2).sum(-1) + 1.0 - (t ** 2).sum(-1)
+    if normalize:
+        d = d / _class_count(p, mask)
     return float(d.mean())
 
 
@@ -162,6 +174,12 @@ def reliability_curve(p, t, mask=None, bins=15, binning="equal_mass"):
     """返回 (桶平均置信度, 桶平均正确率, 桶样本数)，只保留非空桶。"""
     _, conf = top1(p, mask)
     corr = soft_accuracy(p, t, mask)
+    if bins < 1 or int(bins) != bins:
+        raise ValueError("bins must be a positive integer")
+    if binning not in ("equal_mass", "equal_width"):
+        raise ValueError("binning must be equal_mass or equal_width")
+    if not len(conf):
+        return np.array([]), np.array([]), np.array([], dtype=int)
     edges = (_bin_edges_equal_mass(conf, bins) if binning == "equal_mass"
              else _bin_edges_equal_width(bins))
     which = np.clip(np.digitize(conf, edges[1:-1], right=False), 0, len(edges) - 2)
@@ -178,67 +196,51 @@ def reliability_curve(p, t, mask=None, bins=15, binning="equal_mass"):
 
 
 def ece(p, t, mask=None, bins=15, binning="equal_mass"):
-    """期望校准误差。它**不是 proper score**，可以通过换分桶改善，所以永远与
-    Brier / NLL 一起报告，单独变动的 ECE 不予采信（方案 R6）。"""
+    """Binned top-label calibration error (not a proper score).
+
+    Report alongside distribution_l2, expected_brier and NLL, with bin settings.
+    """
     conf_b, corr_b, n_b = reliability_curve(p, t, mask, bins, binning)
     if len(n_b) == 0:
         return 0.0
     return float((n_b / n_b.sum() * np.abs(corr_b - conf_b)).sum())
 
 
-def binomial_noise_floor(p, counts, mask=None, bins=15, binning="equal_mass",
-                         n_sim=200, seed=0):
-    """给定**每个样本的标注者人数**，理想校准模型的期望 ECE（标注噪声那一份）。
+def ece_annotation_reference(p, counts, mask=None, bins=15, binning="equal_mass",
+                             n_sim=200, seed=0):
+    """Monte Carlo ECE under an assumed independent annotation model.
 
-    一个真实校准的模型，它报出的 p̂ 就是对真实频率的最好估计。但用它去和**有限
-    标注**得到的经验频率比，仍会有偏差 —— 因为经验频率本身在抖。这个函数把那份
-    抖动量化出来：对每个样本抽 `Binomial(counts_i, conf_i) / counts_i` 作为
-    "另一批标注者会给出的标签"，重算一次 ECE，重复 n_sim 次取均值。置信度**不重抽**
-    —— 理想模型的自信就是它的输出，抖动的只有标签。
-
-    **实测说明（一开始按直觉写错过，所以写在这里）**：counts=100 时这个地板只有
-    约 0.001，而不是逐条标准误 0.05 那个量级。原因很直接 —— ECE 是**桶内平均**，
-    桶内噪声按 1/√n_b 衰减：0.05/√1333 ≈ 0.0014。0.05 是**逐条**误差，不是 ECE
-    的误差；两者常被混为一谈。所以：
-
-      - 想让 ECE 地板抬高到可见，得让每桶样本数很少（评测集小、或按 provenance /
-        per-schema 细分到几百条）。
-      - 在 15 桶 × 数千样本下这份校正是可忽略的，**真正的噪声来自评测集本身的
-        有限抽样**（完美校准的模型在 2 万条上 ECE 也有约 0.007，量级反而更大）。
-        那一份由 `bootstrap_ci` 负责，不由本函数负责。
-
-    没有标注数（合成集的 P* 是精确值）时地板为 0。仍按方案要求一等报告，但要知道
-    它小在哪儿，否则会以为 0.007 是模型的功劳。
+    Hold confidence fixed and draw Binomial(count_i, conf_i)/count_i. Only
+    rows with finite positive counts participate, including in bin construction.
+    Returns None when no annotation counts are available. This diagnostic depends
+    on counts, binning, sample size, and the assumption that confidence is the
+    true top-label probability; it is neither a universal lower bound nor a
+    subtractable bias estimate for observed ECE.
     """
-    # `rng.binomial` 的 `n` 必须是整数，而上游 `counts_array` 给的是 float64。
-    # 这一行以前不存在，且不是疏忽 —— 是这条路径**从来没有被真的跑到过**：
-    # 没有任何数据集写过 `target.counts`，于是 counts 恒为 None、整个函数在第一行
-    # 就返回 0。等 `target.counts` 补上之后，第一次真跑就在下面抛 TypeError。
-    counts = np.asarray(counts, dtype=np.int64)
-    if counts.size == 0 or counts.max() <= 0:
-        return 0.0
-    _, conf = top1(p, mask)
-    # 理想模型的"正确率"就是它自己的置信度，所以直接拿 conf 当 corr 的期望。
+    if counts is None:
+        return None
+    counts = np.asarray(counts, dtype=np.float64)
+    if counts.shape != (len(p),):
+        raise ValueError("counts must contain one annotation count per row")
+    keep = np.isfinite(counts) & (counts > 0)
+    if not keep.any():
+        return None
+    if np.any(counts[keep] != np.floor(counts[keep])) or n_sim < 1:
+        raise ValueError("positive counts must be integers and n_sim must be positive")
+    counts = counts[keep].astype(np.int64)
+    _, conf = top1(np.asarray(p)[keep], None if mask is None else np.asarray(mask)[keep])
+    edges = (_bin_edges_equal_mass(conf, bins) if binning == "equal_mass"
+             else _bin_edges_equal_width(bins))
+    which = np.clip(np.digitize(conf, edges[1:-1], right=False), 0, len(edges) - 2)
+    groups = [which == b for b in range(len(edges) - 1)]
+    groups = [sel for sel in groups if sel.any()]
     rng = np.random.default_rng(seed)
-    total, wsum = 0.0, 0
+    total = 0.0
     for _ in range(n_sim):
-        corr_sim = rng.binomial(counts, np.clip(conf, 0, 1)) / np.maximum(counts, 1)
-        edges = (_bin_edges_equal_mass(conf, bins) if binning == "equal_mass"
-                 else _bin_edges_equal_width(bins))
-        which = np.clip(np.digitize(conf, edges[1:-1], right=False), 0, len(edges) - 2)
-        num = 0.0
-        n_tot = 0
-        for b in range(len(edges) - 1):
-            sel = which == b
-            n = int(sel.sum())
-            if n == 0:
-                continue
-            num += n * abs(float(corr_sim[sel].mean()) - float(conf[sel].mean()))
-            n_tot += n
-        if n_tot:
-            total += num / n_tot
-            wsum += 1
-    return float(total / wsum) if wsum else 0.0
+        corr_sim = rng.binomial(counts, np.clip(conf, 0, 1)) / counts
+        total += sum(sel.mean() * abs(corr_sim[sel].mean() - conf[sel].mean())
+                     for sel in groups)
+    return float(total / n_sim)
 
 
 def bootstrap_ci(fn, n, n_boot=1000, alpha=0.05, seed=0):
@@ -277,24 +279,33 @@ def ordinal_mae(p, t, levels=None, mask=None):
 # 弃权
 # ---------------------------------------------------------------------------
 def risk_coverage_curve(p, t, mask=None, abstain_idx=None):
-    """按置信度从高到低排序，返回 (覆盖率, 风险=1−准确率, 阈值)。
+    """Return coverage, accepted risk, threshold for conf >= threshold.
 
-    `abstain_idx` 给出时，把"预测为弃权"的样本视为不覆盖（方案：弃权是一个候选，
-    熵阈值规则只是事后补充的画图手段）。
+    All equal-confidence rows enter together. Predictions equal to abstain_idx
+    (a scalar or one index per row; -1 means no abstain candidate) never count
+    as accepted. Coverage divides by all rows; risk divides only by accepted
+    rows and uses 1-t[pred]. Zero-coverage risk is NaN (serialize as JSON null).
+    The initial threshold +inf represents accepting nothing.
     """
     idx, conf = top1(p, mask)
-    correct = (idx == np.asarray(t).argmax(-1)).astype(np.float64)
-    if abstain_idx is not None:
-        keep = idx != abstain_idx
+    correct = soft_accuracy(p, t, mask)
+    if abstain_idx is None:
+        keep = np.ones(len(idx), dtype=bool)
     else:
-        keep = np.ones_like(conf, dtype=bool)
-    order = np.argsort(-conf)
-    ks = np.arange(1, len(order) + 1)
-    hit = correct[order].cumsum()
-    cov = np.where(keep[order].cumsum() > 0, ks / len(order), 0.0)
-    risk = 1.0 - hit / ks
-    thr = conf[order]
-    return cov, risk, thr
+        abstain = np.asarray(abstain_idx)
+        if abstain.ndim > 1 or (abstain.ndim == 1 and abstain.shape != idx.shape):
+            raise ValueError("abstain_idx must be scalar or one index per row")
+        keep = idx != abstain
+    if not len(idx):
+        return np.array([0.0]), np.array([np.nan]), np.array([np.inf])
+    order = np.argsort(-conf, kind="stable")
+    ends = np.r_[np.flatnonzero(np.diff(conf[order]) != 0), len(order) - 1]
+    accepted = keep[order].cumsum()[ends]
+    hit = (correct[order] * keep[order]).cumsum()[ends]
+    risk = np.full(len(ends), np.nan)
+    np.divide(accepted - hit, accepted, out=risk, where=accepted > 0)
+    return (np.r_[0.0, accepted / len(idx)], np.r_[np.nan, risk],
+            np.r_[np.inf, conf[order][ends]])
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +313,7 @@ def risk_coverage_curve(p, t, mask=None, abstain_idx=None):
 # ---------------------------------------------------------------------------
 def compute_metrics(p, t, mask=None, provenance=None, is_ord=None, levels=None,
                     counts=None, bins=15, binning="equal_mass", with_ci=False):
-    """单组样本的全部指标。`provenance` / `counts` 给了就算噪声地板。"""
+    """单组样本的指标；counts 可提供假设标注模型下的 MC 参考量。"""
     out = {
         "n": int(len(p)),
         "accuracy": accuracy(p, t, mask),
@@ -313,14 +324,16 @@ def compute_metrics(p, t, mask=None, provenance=None, is_ord=None, levels=None,
         # 与新结果不可比，而且恰好把这个问题藏起来。
         "accuracy_soft": float(np.mean(soft_accuracy(p, t, mask))),
         "nll": nll(p, t, mask),
-        "brier": brier(p, t, mask),
+        "distribution_l2": distribution_l2(p, t, mask),
+        "expected_brier": expected_brier(p, t, mask),
         "ece": ece(p, t, mask, bins, binning),
         "ece_binning": binning,
         "ece_bins": bins,
     }
     if counts is not None:
-        out["ece_noise_floor"] = binomial_noise_floor(p, counts, mask, bins, binning)
-        out["ece_corrected"] = max(0.0, out["ece"] - out["ece_noise_floor"])
+        out["ece_annotation_reference"] = ece_annotation_reference(p, counts, mask, bins, binning)
+        c = np.asarray(counts, dtype=np.float64)
+        out["ece_annotation_reference_n"] = int((np.isfinite(c) & (c > 0)).sum())
     if is_ord is not None and np.any(is_ord):
         sel = np.asarray(is_ord, dtype=bool)
         out["ordinal_mae"] = ordinal_mae(p[sel], t[sel], levels, None if mask is None else mask[sel])
@@ -350,17 +363,10 @@ def _subset(v, sel):
 
 
 def metrics_by_provenance(p, t, mask=None, provenance=None, **kw):
-    """按 provenance 分桶 + 一个 `all` 总桶。**这是对外的主入口。**
+    """Report all rows and each provenance, including valid hard-label ECE.
 
-    `all` 桶同时给出两份：`all`（全部样本）和 `calibration`（剔除 `hard`）。
-    后者才是能拿去和论文比的那个 —— 前者混进了贝叶斯上界为 100% 的样本，
-    会把 ECE 稀释得很好看。
-
-    注意 `hard` 与 `calibration` **不是互斥的两类**：`calibration` 是
-    `explicit_rng ∪ marginalized ∪ tie_set ∪ human_annotators` 的并集，所以在
-    同时含 `hard` 与软来源的集合上，`all` 的 n = `calibration` 的 n + `hard` 的 n；
-    若整个集合都是软来源，则 `calibration` 不会单独出现（它与 `all` 完全重合，
-    再给一行只会让人误以为少算了一部分样本）。
+    `soft_targets` aggregates the named soft-target provenances when it differs
+    from `all`. Grouping describes target construction, not calibration eligibility.
     """
     res = {"all": compute_metrics(p, t, mask, **kw)}
     if provenance is None:
@@ -374,9 +380,9 @@ def metrics_by_provenance(p, t, mask=None, provenance=None, **kw):
             p[sel], t[sel], None if mask is None else mask[sel],
             **{k: _subset(v, sel) for k, v in kw.items()},
         )
-    keep = np.isin(provenance, CALIBRATION_PROVENANCE)
+    keep = np.isin(provenance, SOFT_TARGET_PROVENANCE)
     if 0 < keep.sum() < len(provenance):
-        res["calibration"] = compute_metrics(
+        res["soft_targets"] = compute_metrics(
             p[keep], t[keep], None if mask is None else mask[keep],
             **{k: _subset(v, keep) for k, v in kw.items()},
         )

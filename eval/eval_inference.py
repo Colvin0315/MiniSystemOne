@@ -12,10 +12,72 @@
 `softmax(z/T)_k ∝ exp(z_k/T) = p_k^(1/T)`，多出的 `Σexp(z_j)` 因子在归一化时抵消。
 所以 `per_sample` 的体积比存 logits 小一个量级，而任何温度都能事后重算。
 """
+import json
+import math
+import os
+
 import numpy as np
 import torch
+from transformers import AutoTokenizer
 
 from dataset.decision_dataset import collate_decision
+from model.model_system_one import DecisionConfig, MiniSystemOneForDecision
+from trainer.trainer_utils import ckpt_info, file_sha1, init_model, verify_tokenizer
+
+
+def load_decision(checkpoint, tokenizer_dir, device="cuda", **overrides):
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
+        raise ValueError("需要可用的 CUDA 环境；不会退回 CPU。")
+    if not os.path.isfile(checkpoint):
+        raise ValueError(f"找不到决策权重：{checkpoint}")
+    info = ckpt_info(checkpoint)
+    meta = info.get("meta", {})
+    if not info.get("config") or meta.get("stage") != "decision":
+        raise ValueError("需要带 config 和 decision 阶段元信息的自描述权重。")
+    if not meta.get("tokenizer_sha1"):
+        raise ValueError("权重缺少 tokenizer_sha1，无法确认配套词表。")
+    try:
+        verify_tokenizer(checkpoint, tokenizer_dir)
+    except SystemExit as error:
+        raise ValueError(str(error)) from error
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)
+    config = DecisionConfig(**info["config"])
+    for key, value in overrides.items():
+        if value is not None and getattr(config, key) != value:
+            raise ValueError(f"{key}={value} 与权重配置 {getattr(config, key)} 不符")
+    if config.vocab_size != len(tok):
+        raise ValueError("词表大小与 checkpoint 配置不一致")
+    for token, expected in (("<pad>", config.pad_token_id), ("<sep>", config.sep_token_id)):
+        if tok.convert_tokens_to_ids(token) != expected:
+            raise ValueError(f"{token} 的 token id 与 checkpoint 不一致")
+    config.use_gradient_checkpointing = False
+    model = init_model(MiniSystemOneForDecision, config, checkpoint, device, strict=True)
+    model.eval()
+    return tok, model, meta
+
+
+def load_temperature(path, checkpoint, tokenizer_dir):
+    with open(path, encoding="utf-8") as f:
+        temp = json.load(f)
+    if not isinstance(temp, dict) or not isinstance(temp.get("meta"), dict):
+        raise ValueError("温度文件缺少 meta 哈希信息")
+    for key, artifact in (("ckpt_sha1", checkpoint),
+                          ("tokenizer_sha1", os.path.join(tokenizer_dir, "tokenizer.json"))):
+        digest = temp["meta"].get(key)
+        if not isinstance(digest, str) or len(digest) not in (12, 16):
+            raise ValueError(f"温度文件缺少有效的 {key}")
+        if file_sha1(artifact, n=len(digest)) != digest:
+            raise ValueError(f"温度文件的 {key} 与当前模型/词表不匹配，请重新校准。")
+    values = [temp.get("global")]
+    for key in ("primitive", "primitive_k"):
+        table = temp.get(key, {})
+        if not isinstance(table, dict):
+            raise ValueError(f"温度 {key} 必须是对象")
+        values.extend(table.values())
+    if any(isinstance(t, bool) or not isinstance(t, (int, float))
+           or not math.isfinite(t) or not 0.05 <= t <= 20 for t in values):
+        raise ValueError("所有温度必须在拟合器支持的 [0.05, 20] 范围内，且必须提供 global 温度")
+    return temp
 
 # 逐样本元信息：全部是「不进模型、但报告与误差分析要用」的东西。
 META_KEYS = ("id", "source", "provenance", "template_id", "entity_pool",
@@ -100,15 +162,11 @@ def _pad_stack(arrays, fill, dtype):
 
 
 def counts_array(collected):
-    """逐样本标注者人数；没有（合成集的 P* 是精确值）时返回 None。
-
-    返回 None 而不是 0 数组是刻意的：`compute_metrics` 用 `counts is None` 判断
-    "要不要报噪声地板"，一个全 0 的数组会让它兴高采烈地报出一个假的地板 0。
-    """
+    """Return annotation counts, with zero marking unobserved counts."""
     counts = collected.get("counts")
-    if not counts or any(c is None for c in counts):
+    if not counts or not any(c is not None and c > 0 for c in counts):
         return None
-    return np.asarray(counts, dtype=np.float64)
+    return np.asarray([c if c is not None else 0 for c in counts], dtype=np.float64)
 
 
 def effective_k(mask):

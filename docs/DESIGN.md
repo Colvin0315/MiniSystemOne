@@ -8,7 +8,7 @@
 
 ## 0. 一句话
 
-> state + typed questions → 带校准概率的类型化决策，**单次并行前向**，不生成文本。
+> state + typed questions → 带候选概率的类型化决策，**单次并行前向**，不生成文本；校准需实测。
 
 三个 primitive：**Noul**（yes/no）、**Choice**（动态候选集，上限 255）、
 **Score**（序数等级）。它们**不是三个 head**，见 §2。
@@ -55,8 +55,8 @@
 
 3. **弃权是一个候选**（G4 的 `abstain`，CLINC150 的 `oos`），不是一个分支。
    零成本、零新 head，且概念正确：弃权**就是**在选项里做决策。
-   `eval_metrics.risk_coverage_curve` 提供了按置信度弃权的曲线函数，
-   **但本仓库没有脚本产出它** —— 函数在，调用者不在。
+   `eval_metrics.risk_coverage_curve` 按完整置信度并列组计算阈值策略；预测弃权不计
+   自动覆盖，风险分母仅含接受请求，零覆盖风险为未定义。自定义教程使用此函数。
 
 `<yes>/<no>/<abstain>` 作为**单 token** 候选（而不是让 "yes" 走正常 BPE）是刻意的：
 pooled 向量最干净，是仅有的三个"语义"特殊 token，且理由正当 ——
@@ -87,9 +87,10 @@ Noul 是一等 primitive，给它的答案原子 token 是真实的建模选择�
 
 > **每个候选的 logit 独立计算，只有 softmax 归一化把它们耦合起来。**
 
-这正是"加入一个无关候选不应改变其他候选得分"的**正确归纳偏置**。所以它是默认值，
-开着它是消融实验（步骤 15）。改一个开关就能把这条主张变成实测数字，也是 §5、§6
-两个不变量的前提。
+这提供候选顺序/分块不变性和缓存复用，但也限制集合依赖推理：固定前缀和温度 T 时，
+`p_i/p_j = exp((s_i-s_j)/T)`，增加其他候选不会改变原有两项的概率比。
+因此它不适合所有需要候选间比较的任务。若按 K 切换温度，概率比还会受该温度变化影响。
+新增候选或 schema 只是输入契约支持，不代表模型学会了新任务。
 
 ### 三个实现要点，每一个都对应一次踩坑
 
@@ -150,9 +151,8 @@ class AttnPool(nn.Module):        # z 的来源：state ∪ question 上的 atte
 一旦塌缩，`z` 就退化成"某一个 token 的表示"，问题条件信息全丢，校准直接崩。
 残差到 masked mean 保证 `z` 永远至少含有"整段前缀的平均"这个成分。
 
-**`in_ln` + `mid_ln` 对校准是必需的。** 它们把 logit 的尺度约束住，使其不随 K 和
-primitive 漂移。没有它们，单一温度不够用 —— 大 K 样本的 logit 尺度天然更大，
-温度校准会在 K 之间来回拉扯。
+`in_ln` + `mid_ln` 是用于稳定表示尺度的建模选择，不保证各 K/primitive 的
+logit 尺度相同，也不保证单一温度足够；校准需在留出集按组验证。
 
 ```python
 class DecisionHead(nn.Module):
@@ -187,18 +187,18 @@ attend 过 state，`H[question_positions]` 里已经含有"问题条件下的 st
 ## 6. Loss
 
 ```
-L = CE(p*, softmax(logits)) + λ_b · Brier(p*, p) + is_ord · λ_o · CDF-MSE(p*, p)
+L = CE(t, p) + λ_b · sum_k (p_k-t_k)^2 + is_ord · λ_o · CDF-MSE(t, p)
 ```
 
-- **λ_b = 0.5，作用于全部样本。**
-  对软目标，`∂CE/∂logit = p−p*`，`∂Brier/∂logit = 2p⊙(p−p*)`，方向相同只差 `2p`
-  的缩放，所以 Brier 在很大程度上与 CE **冗余**。它的真实价值有三：
-  ① 直接优化我们报告的那个指标；② 在**硬目标**上起 label-smoothing 式的置信度封顶
-  作用，实测改善 ECE；③ 它是 proper score，因此与外部 LLM 的 verbalized
-  confidence **可比**。
+- **λ_b = 0.5，作用于全部样本。** 平方项是 distribution L2，逐条对类别求和再取样本均值。
+  它与相对于 t 的 expected Brier 相差常数 `mean(1-sum(t**2))`；one-hot 时相同。
+  硬标签 CE 和 Brier 都是 proper scoring rules，可在期望上学习条件概率；
+  Brier 不等于 label smoothing，不保证置信度封顶。softmax 的 Jacobian 也意味着
+  L2 的 logit 梯度不是简单逐元素 `2p*(p-t)`。
 
-  **不做 K 归一化**（会在大 K 处让该项消失，而那正是最需要它的地方）。
-  提供 `--brier_normalize` 让读者自己看差别。
+  默认不做 K 归一化；`--brier_normalize` 显式除以每条有效 K，并经 forward 传入损失。
+  `--lambda_brier` 和内部 logger `brier` 保留训练接口名，评测输出使用
+  `distribution_l2` 和 `expected_brier`，无旧指标别名。
 
 - **λ_o = 0.5，仅 Score 样本。**
   `mse_loss(p.cumsum(-1)[...,:-1], target.cumsum(-1)[...,:-1])`。
@@ -340,11 +340,11 @@ Windows WDDM 在显存见底时**静默换页到共享内存**，代价是速度
 
 ---
 
-## 11. 校准为什么必须靠数据构造，不能靠 loss 技巧
+## 11. 校准需要数据与评测，不能由 loss 名称保证
 
-**one-hot 标签学不出校准。** Brier loss 作用在 one-hot 上只是个正则项，
-模型永远学不到"我报 0.8 时应该 80% 正确"。要演示校准，训练数据里必须有
-**已知真实条件分布**的样本。
+硬标签可以学习和评估校准；经验 CE/观测 Brier 的期望在真实条件分布处最优。
+软目标不是必要条件，本项目采用它们是为了直接监督并检查已知条件分布。
+ECE 是分桶 top-label 指标，不证明逐条分布准确，也不证明 OOD 能力。
 
 | provenance | 含义 | 来源 |
 |---|---|---|
@@ -352,10 +352,12 @@ Windows WDDM 在显存见底时**静默换页到共享内存**，代价是速度
 | `marginalized` | 目标是隐藏变量的边缘化 | 合成 G3/G4 |
 | `tie_set` | 状态确实不决定唯一答案，目标为有效集上的均匀分布 | 合成 G2/G4 |
 | `human_annotators` | 真实人类标注分歧分布 | ChaosNLI (N≈100) |
-| `hard` | 硬标签，**排除在所有校准指标之外** | CLINC150 / banking77 / Amazon |
+| `hard` | 观测硬标签，同样参与校准指标 | CLINC150 / banking77 / Amazon |
 
-**所有指标按 provenance 分桶报告。** 混在一起算 ECE 没有意义 —— 不同来源的
-不可约噪声底不同，混起来 ECE 度量的是混样比例而不是校准。
+报告 `all`、各 provenance 和必要时的 `soft_targets` 聚合。混合总体合法但需说明组成，
+子组指标用于检查总体掩盖的误差。标注 MC 参考量不是通用下界，不从 ECE 扣除。
+动态候选下标量温度是本项目的简单选择，不是唯一可迁移的参数化；迁移效果需实测。
+详见 [CALIBRATION.md](CALIBRATION.md)。
 
 ### 软目标的合法构造（三者共同点：目标由生成器自身逻辑、从它明确知道"是否渲染进了
 state"的量算出，`audit` 里留下记录）
@@ -413,7 +415,7 @@ R1 风险（P* 可能依赖未渲染进 state 的信息）的缓解见 §12。
 
 **口径纪律（这部分继承自被删掉的四路对比，仍然成立）：**
 
-1. **同一套指标代码。** 所有对象的 ECE / Brier / NLL 都由 `eval/eval_metrics.py`
+1. **同一套指标代码。** 所有对象的 ECE / distribution L2 / expected Brier / NLL 都由 `eval/eval_metrics.py`
    算，不另外实现。用同一指标展示"LLM 的 verbalized confidence 校准很差"，
    是对本项目论点最直接的证据 —— 而两份实现各算一次必然漂移（方案 R6）。
 2. **报告 schema 错误率。** 自由生成的 LLM 会输出候选集以外的字符串，这是它的

@@ -18,7 +18,7 @@ scorer 拿到的 pooled 向量噪声变大。成本为零，直接改善被测�
 用法：
     python trainer/train_tokenizer.py                       # 默认 150k 预训练 + 20k 合成
     python trainer/train_tokenizer.py --n_docs 20000        # 快速冒烟
-    python trainer/train_tokenizer.py --pretrain_path ""    # 只用合成语料
+    python trainer/train_tokenizer.py --synthetic_only --n_synth 2000 --skip_eval --out_dir out/tutorial_tokenizer
 """
 import argparse
 import json
@@ -108,7 +108,8 @@ def train(args):
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         special_tokens=SPECIALS,
     )
-    tokenizer.train_from_iterator(iter_corpus(args), trainer=trainer, length=args.n_docs)
+    # Omit the progress length: requested counts are upper bounds for local corpora.
+    tokenizer.train_from_iterator(iter_corpus(args), trainer=trainer)
     tokenizer.decoder = decoders.ByteLevel()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -271,12 +272,31 @@ def evaluate(tokenizer_dir):
     return ok
 
 
+def validate_tokenizer(tokenizer_dir):
+    """Always check the loading/ID contract, even when quality gates are skipped."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)
+    for expected, token in enumerate(SPECIALS):
+        actual = tok.convert_tokens_to_ids(token)
+        if actual != expected or tok.decode([actual]) != token:
+            raise ValueError(f"Tokenizer contract failed for {token}: "
+                             f"expected id {expected}, got {actual}.")
+    if tok.pad_token_id != 0 or tok.unk_token_id != 1:
+        raise ValueError("Tokenizer pad/unk IDs do not match the model contract.")
+    print(f"tokenizer 本地加载与特殊 token 契约通过（词表 {len(tok)}）")
+
+
 def main():
     p = argparse.ArgumentParser(description="MiniSystemOne tokenizer 训练与门槛校验")
-    p.add_argument("--pretrain_path", default="../minimind/dataset/pretrain_t2t_mini.jsonl",
+    p.add_argument("--pretrain_path", default="dataset/pretrain_zh.jsonl",
                    help="中文预训练语料 jsonl（每行 {\"text\": ...}）")
     p.add_argument("--en_path", default="dataset/pretrain_en.jsonl",
-                   help="英文预训练语料 jsonl；空字符串则不掺英文")
+                   help="英文预训练语料 jsonl；缺失必须显式允许回退")
+    p.add_argument("--synthetic_only", action="store_true",
+                   help="仅用双语 train 模板语料演示离线流程，不替代自然语言预训练")
+    p.add_argument("--allow_missing_corpus", action="store_true",
+                   help="显式允许跳过缺失自然语料；空或损坏的文件仍报错")
     p.add_argument("--en_share", type=float, default=0.5, help="英文应占的字符比例")
     p.add_argument("--out_dir", default="model", help="tokenizer.json 输出目录")
     p.add_argument("--n_docs", type=int, default=150000, help="中英混合预训练文档数")
@@ -287,7 +307,10 @@ def main():
     args = p.parse_args()
 
     out = train(args)
-    if not args.skip_eval:
+    validate_tokenizer(out)
+    if args.skip_eval:
+        print("已显式跳过正式压缩率质量门禁；此 tokenizer 不代表正式训练质量。")
+    else:
         sys.exit(0 if evaluate(out) else 1)
 
 

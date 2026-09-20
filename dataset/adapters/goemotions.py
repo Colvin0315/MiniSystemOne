@@ -124,9 +124,7 @@ class GoEmotions(PublicAdapter):
                 "provenance": self.provenance,
                 "target": {"kind": "soft", "p": p, "provenance": self.provenance,
                            "renormalized": False,
-                           # 同 chaosnli：`counts` 才是 `binomial_noise_floor` 读的字段。
-                           # 这里 N 只有 3–5，地板会大到肉眼可见 —— 那正是收录
-                           # GoEmotions 的目的：反衬 ChaosNLI 的 N≈100。
+                           # Counts support an assumption-dependent annotation reference.
                            "counts": g["n"],
                            "audit": {"n_annotators": g["n"], "n_votes": total}},
                 "meta": {"variant": self.name},

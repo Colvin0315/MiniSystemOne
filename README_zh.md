@@ -2,11 +2,49 @@
 
 > **从 0 训练一个概率决策模型 —— 不用 LLM，不做解码，不生成 JSON。**
 
-一个约 2700 万参数的模型：输入 **state + 类型化问题**，输出**带校准概率的类型化决策**，
-**单次并行前向**完成。没有自回归循环，不生成文本，不靠受限解码兜底。
+一个约 2700 万参数的模型：输入 **state + 类型化问题**，输出**带候选概率的类型化决策**，
+**单次并行前向**完成。是否校准需要实测，并非结构保证。没有自回归循环，不生成文本，不靠受限解码兜底。
 
 从随机初始化开始训练，风格对齐 MiniMind：单一共享双向编码器、单一决策头、单一 loss。
-本 README 里的每一个数字都可以在一台 8 GB 显存的笔记本 GPU 上从本仓库复现。
+历史完整实验数字使用一台 8 GB 笔记本 GPU 与原始语料测得，不是 quickstart 结果，
+也不保证换硬件或换数据后得到相同数字。
+
+## 从这里开始：三条路线
+
+在仓库根目录执行命令，先安装[复现](#复现)一节的环境。模型训练/推理使用 CUDA，
+推荐路线不回退到 CPU。**目前没有公开权重下载 URL**；需要本地已有配套权重和 tokenizer。
+
+1. **已有本地权重，直接体验。** 跑过 quickstart 后可输入无标签请求：
+   ```bash
+   python inference.py --ckpt out/quickstart/decision/decision.pth --tokenizer out/quickstart/tokenizer --input examples/inference/choice.json
+   # 可选：应用配套温度文件
+   python inference.py --ckpt out/quickstart/decision/decision.pth --tokenizer out/quickstart/tokenizer --input examples/inference/choice.json --temperature out/quickstart/calibration/T.json
+   ```
+   另外两种 primitive 用 `noul.json` / `score.json`。不传温度会明确标记未校准。
+   换成本地其他 checkpoint 时必须同时配对其 tokenizer 和温度文件。
+   CLI 返回 JSON 是程序序列化，不是模型自回归生成 JSON。
+2. **离线从零训练玩具模型。** 安装依赖后执行：
+   ```bash
+   python scripts/quickstart.py
+   ```
+   双语合成 train 模板、h128/L2、MLM/决策各 20 次更新，依次跑 tokenizer→数据→MLM→
+   决策→温度拟合→留出评测→三例推理，产物隔离在 `out/quickstart/`，不静默覆盖已有目录。
+   明确跳过正式压缩率门禁，但仍验证特殊 token。它教完整流程，**不代表业务效果，
+   不复现下面 26.89M 历史实验表**。
+3. **完整实验复现。** 见[复现](#复现)。自行取得自然语料，准备
+   `dataset/pretrain_zh.jsonl` 和 `dataset/pretrain_en.jsonl` 后逐阶段运行。
+   训练命令不会神奇地下载原始语料；替换来源就是新实验，不能宣称复现历史表。
+
+本次 RTX 4070 Laptop 实测：按[固定配置](configs/quickstart.json)全流程 **90.5 秒**；
+MLM 长度 256、决策长度 2048，以容纳大候选集。训练峰值已分配张量显存分别为
+0.097/0.210 GB，**不是整卡显存需求**。96 条留出样本准确率 29.2%，只能证明流程跑通，
+不能作为业务效果；[实测摘要](results/quickstart.json)可核验。其他显存档位未实测。
+
+下一步：[第一个自定义任务](docs/FIRST_TASK.md)，客服工具路由与人工接管。
+新增 schema/候选只是输入契约支持，不等于学会新任务。默认独立候选评分在固定前缀与
+温度 T 下满足 `p_i/p_j=exp((s_i-s_j)/T)`，新增其他候选只改变归一化，不改变旧两项
+概率比；这限制集合依赖推理。低分桶 ECE 不证明单条请求正确或 OOD 安全。
+
 
 ---
 
@@ -42,9 +80,9 @@ Jev 是闭权重、只提供 API 的。
 - **一个编码器、一个 head、一个 loss。** Noul、Choice、Score 不是三条代码路径，
   而是**同一个**候选集上的 softmax：Noul 是 `{yes, no}`，Score 是 `{1..5}`。
   **弃权是一个候选，不是一个分支。**
-- **校准是重点，所以数据里必须真的有它。** one-hot 标签教不会模型校准 ——
-  作用在 one-hot 上的 Brier loss 只是个把置信度推向极端的正则项。本仓库的合成生成器
-  产出的目标**真实条件分布已知**，这才让 ECE 成为可测量的量而不是装饰。
+- **校准必须实测。** 硬标签交叉熵和 Brier 都是 proper scoring rules，可在期望上
+  学习条件概率；软标签不是必要条件。本仓库使用已知合成条件分布，便于直接监督
+  和检查完整分布，而不是因为硬标签不能校准。
 - **诚实是构造出来的。** 本项目自己预测错的地方（问题摊销、延迟），README 直接写明并划掉；
   模型失败的地方（真实文本、OOD），数字照报不埋。
 
@@ -97,17 +135,21 @@ Score 只是 `{1,2,3,4,5}`。没有单独的 sigmoid head；
 
 ### 为什么校准才是重点
 
-**one-hot 标签学不出校准。** Brier loss 作用在 one-hot 目标上只是个把置信度推向极端的
-正则项：它永远教不会模型"我报 0.8 的时候应该 80% 正确"，因为训练信号里根本没有
-关于 0.8 的信息。
+**硬标签可以学习和评估校准。** 观测类别交叉熵和 multiclass Brier 的条件期望
+都在真实条件分布处最优；单条 one-hot 不揭示完整分布，但跨样本经验风险可用于估计它。
+软标签是便利，不是必要条件。
 
-所以训练数据里**必须**有真实条件分布已知的样本。本仓库用三种方式构造它们：
-已知的随机化规则（`explicit_rng`）、对只在 state 里粗粒度暴露的隐藏变量做边缘化
-（`marginalized`）、以及确实并列的答案集（`tie_set`）；真实人类分歧则来自 ChaosNLI
-每条约 100 人的标注（`human_annotators`）。
+本仓库用已知随机规则（`explicit_rng`）、隐藏变量条件边缘化（`marginalized`）、
+定义的并列集（`tie_set`）构造便于直接检查的目标；ChaosNLI 每条约 100 人的标注
+（`human_annotators`）是经验频率，不自动等于真实条件分布。
 
-所有指标**按 provenance 分桶报告** —— 不同来源的不可约噪声底不同，混在一起算 ECE
-得到的是一个没有意义的数。
+报告总体与 provenance 子组并说明组成。**分桶 top-label ECE** 比较置信度与桶内
+`t[argmax p]`，不证明逐条分布准确或 OOD 理解能力。详见[指标契约](docs/CALIBRATION.md)。
+新输出以 `distribution_l2`（逐样本类别平方差**求和**后跨样本平均）替代旧 `brier`，
+新增 `expected_brier = distribution_l2 + mean(1-sum(t**2))`，将旧 `calibration`
+聚合改为 `soft_targets`，不输出兼容别名。标注诊断改名 `ece_annotation_reference`，
+仅是特定假设下的 Monte Carlo 参考量；删除 `ece_corrected`，不从 ECE 相减。
+以下历史表只将旧距离列改名 distribution L2，不填入未测量的历史 expected Brier。
 
 ---
 
@@ -121,29 +163,27 @@ Score 只是 `{1,2,3,4,5}`。没有单独的 sigmoid head；
 
 ### 合成留出集上的校准
 
-`test_known`，n=18,000，K 最大 255。`calibration` 那一行剔除 `hard`：one-hot 目标
-里没有任何关于"世界有多不确定"的信息，混进来只会把 ECE 往"看起来不错"的方向稀释。
+`test_known`，n=18,000，K 最大 255。`soft_targets` 行（历史键 `calibration`）
+剔除 hard 是为了描述软目标子集，不是因为硬标签不能测校准。总体与子组回答不同问题。
 
-| | acc | ECE | Brier | NLL |
+| | acc | ECE | distribution L2 | NLL |
 |---|---|---|---|---|
 | 未校准 | 0.647 | 0.0047 | 0.0249 | 1.0821 |
 | 全局温度 | 0.647 | 0.0038 | 0.0249 | 1.0821 |
 | per-(primitive × K) 温度 | 0.647 | 0.0046 | 0.0248 | 1.0800 |
-| **calibration 子集**（剔 hard，n=16,361） | **0.612** | **0.0061** | 0.0273 | — |
+| **soft_targets 子集**（剔 hard，n=16,361） | **0.612** | **0.0061** | 0.0273 | — |
 
 ![合成集可靠性图](assets/reliability_synth_test_known.png)
 
-**温度几乎无事可做。** 拟合出 `T = 0.965`，NLL 从 1.0629 只动到 1.0628。这正是预期
-结果：模型的校准是**原生的**，因为它的训练目标本来就是分布，而不是事后平滑的
-one-hot。这里报温度校准，主要是为了说明它是个空操作。
+**这个历史拟合中温度影响很小。** `T = 0.965`，NLL 从 1.0629 变为 1.0628。
+它说明在该分布上收益有限，不证明逐条分布准确，也不证明 one-hot 训练无法校准。
 
 ### 该读的是这张表，不是准确率那一列
 
-`accuracy` 把两类上限**结构上不同**的样本混在一起，所以它度量的是 provenance 的
-配比，而不是模型。`tie_set` 样本的目标是有效答案上的均匀分布，于是 `t[argmax p]`
-**无论模型多好**都被压到 `1/k`；one-hot 样本上同一个数才是真准确率。诚实的分母是
-**oracle 上界**：完美校准的模型有 `p* = t`，其软正确率恰好是 `mean(max_k t_k)` ——
-只用数据就能算，不需要模型。
+`accuracy` 是 argmax 一致率（目标并列时按首个下标），不是
+`accuracy_soft = mean(t[argmax p])`。`tie_set` 的软正确率上限为 `1/k`，
+one-hot 下软正确率就是观测准确率。下表报告软正确率及目标定义的 oracle 上界
+`mean(max_k t_k)`。总体指标受组成影响，逐来源报告帮助解释，而不是否定混合总体。
 
 | 来源 | n | 模型 | oracle 上界 | 达成率 |
 |---|---|---|---|---|
@@ -179,19 +219,19 @@ one-hot。这里报温度校准，主要是为了说明它是个空操作。
 
 ![ChaosNLI 可靠性图](assets/reliability_public_test_known_public-chaosnli.png)
 
-474 条，每条约 100 位标注者。**ECE 0.0613**，二项噪声地板 **0.0068**，校正后
-**0.0545**。地板只解释了其中 11%：在真实文本上模型**确实是失准的**，没有任何噪声
-校正能把这件事说圆。右图按设计是空操作 —— 合成集的 `T` 迁移不过去，硬套只会得到
-一个好看但错的数字。
+474 条，每条约 100 位标注者。保留历史原始 **ECE 0.0613** 和标注 MC 参考量
+**0.0068**；旧减法值 **0.0545** 只记录为撤回的解释，**不再称作校正后 ECE**。
+该参考量假设标注独立、置信度就是真实 top-label 概率，不是通用噪声下界。
+旧嵌入图片可能仍带已废弃的地板/校正标题；用当前脚本重画才是新口径。
+右图未应用温度，因此没有测量合成温度向真实文本迁移的成败。
 
-**不要引用混在一起的 `human_annotators` 那个数（ECE 0.3167）。** 它把 ChaosNLI 与
-GoEmotions 平均在一起，而后者只有 3–5 位标注者、目标被量化到 1/3…1/5 的倍数
-（GoEmotions 单独：ECE 0.3253，地板 0.0044）。混出来的数度量的是配比 —— 这正是
-这张图必须用 `--source` 过滤的原因。
+混合 `human_annotators` 的 **ECE 0.3167** 描述该特定混合总体，不代表每个来源。
+同时报告子组：GoEmotions 只有 3–5 位标注者，历史 **ECE 0.3253**、MC 参考量
+**0.0044**。混合指标在组成和目的明确时合法，两个 MC 数字都不能从 ECE 扣除。
 
 ### 合成 → 真实的差距
 
-**0.612 → 0.424**（合成 calibration 子集 → 真实文本上的 ChaosNLI / GoEmotions）。
+**0.612 → 0.424**（合成 soft_targets 子集 → 真实文本上的 ChaosNLI / GoEmotions）。
 从程序生成的规则跨到真实自然语言，大约损失 **19 个点**。更难的公开 split
 （CLINC150、banking77、Amazon）准确率 0.157，高于随机但离可用很远。
 
@@ -235,7 +275,7 @@ K=32 要 18.37 ms：多出 30 个候选**不花任何代价**，因为每次调�
 `eval/compare_apis.py` —— 48 条，按六个生成器分层，候选数 ≤ 8，**三个系统同一批输入、
 同一份 `eval_metrics.py` 打分**。
 
-| 系统 | n | 剔除 | 软准确率 | **ECE** | Brier | **ms/条** | 输出 token |
+| 系统 | n | 剔除 | 软准确率 | **ECE** | distribution L2 | **ms/条** | 输出 token |
 |---|---|---|---|---|---|---|---|
 | **ours** | 48 | **0** | 0.5968 | **0.0248** | 0.0235 | **4.3** | **0** |
 | `jev-latest` | 48 | 0 | 0.5226 | 0.2164 | 0.2165 | 1464.6 | 2,781 |
@@ -254,10 +294,10 @@ K=32 要 18.37 ms：多出 30 个候选**不花任何代价**，因为每次调�
   这是两个不同的命题，这张表只测了后者。
 - **n = 48，每来源 8 条。** 这展示的是形状，不是可引用的数字。
 
-站得住的结论:state 里已把证据印全 —— `audit_synthetic.py` 的渲染充分性检查证明
-`P*` 可从渲染文本 **100% 恢复** —— 所以三个系统看到的是同一份信息。在这个前提下，
-Jev 报出的概率距真实条件分布 **比我们远 8.7 倍**。这就是"带置信度差的排序"与
-"校准分布"的区别，是测出来的，不是断言的。
+渲染充分性检查报告 `P*` 可从文本 **100% 恢复**，即输入包含预期证据。
+在这个小规模历史样本上，Jev 的 **distribution L2（平方差之和）是我们的 8.7 倍**。
+这仅是这些输入上的结果，不是系统能力排名或校准证明：我们在该任务族上训练，
+这种优势同时影响概率指标和准确率。
 
 复现：`python eval/compare_apis.py`（显式 opt-in；需要 `TYPESAFE_API_KEY` 与
 `DEEPSEEK_API_KEY`；**不在任何训练或数据构建路径上**；只写聚合指标，绝不落外部模型的
@@ -384,8 +424,8 @@ python scripts/audit_synthetic.py --model_eval out/eval/decision/decision/synth_
   而不是被埋掉。
 - **在准确率上赢过语言模型。** 主张是延迟、原生校准分布、
   以及**构造上为零的 schema 错误** —— 不是准确率。
-- **在真正 OOD 的输入上给出可靠概率。** 没有模型能做到。上面那张 ChaosNLI 图就是在
-  **展示** OOD 校准退化（ECE 0.0613 对 0.0068 的噪声地板），而不是宣称相反。
+- **保证 OOD 输入上的概率可靠。** 本项目不作此保证。ChaosNLI 历史 ECE 0.0613
+  描述被评测集合，不是单条请求保证，也不是 OOD 检测实验。
 - **以任何意义替代 LLM。** 它是一个组件。本 README 的框架是
   "一个 26M 的决策原生模型长什么样、代价是多少"，而不是"这是 LLM 的替代品"。
 
@@ -494,12 +534,12 @@ trainer/
                           unbuffer_stdout
   train_tokenizer.py      训练 BPE 并强制压缩率门槛
   train_mlm.py            Stage 1：MLM 预训练
-  train_decision.py       Stage 2：CE + λ_b·Brier + λ_o·CDF-MSE
+  train_decision.py       Stage 2：CE + λ_b·distribution L2 + λ_o·CDF-MSE
   calibrate_temperature.py  LBFGS 拟合 log T，三种粒度
 eval/
-  eval_metrics.py         纯函数：accuracy、nll、brier、ece、reliability_curve、
+  eval_metrics.py         纯函数：accuracy、nll、distribution_l2、expected_brier、ece、reliability_curve、
                           risk_coverage_curve、ordinal_mae、expected_score、
-                          binomial_noise_floor、bootstrap_ci
+                          ece_annotation_reference、bootstrap_ci
   eval_harness.py         输出 metrics / by_provenance / per_sample
   eval_efficiency.py      延迟、吞吐、显存、问题摊销
   make_reliability_plot.py
@@ -551,13 +591,18 @@ print(ckpt_info("out/decision/decision.pth")["meta"])
 
 ```bash
 conda create -n minimind python=3.12
+conda activate minimind
 pip install -r requirements.txt
 ```
 
 ### 0. 语料（一次性，需要联网）
 
-`dataset/pretrain_en*.jsonl` **不入库** —— 那是 61 MB 可下载的语料。先把它重建出来
-（约 20 分钟）。**训练全程不联网**，只有这一步联网。
+`dataset/pretrain_en*.jsonl` **不入库**，历史英文语料约 61 MB。下列命令联网取得并
+混合 Alpaca/Wikitext。中文需另外自行取得：原始默认读取兄弟 MiniMind 仓库的
+`dataset/pretrain_t2t_mini.jsonl`。按照该项目说明与使用条款获取对应来源/版本，
+放置或转换为 **`dataset/pretrain_zh.jsonl`**，UTF-8，每行 `{"text":"非空正文"}`。
+这里不编造该历史本地文件的下载 URL；需自行核验来源，替换语料不等于复现旧表。
+Tokenizer/MLM 只消费本地文件，不会自动下载原始语料。
 
 ```bash
 python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_alpaca.jsonl \
@@ -568,15 +613,15 @@ python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_wiki.jsonl \
 python dataset/pretrain_corpus.py blend --out dataset/pretrain_en.jsonl
 ```
 
-> **漏掉这一步不会报错，只会静默变弱。** `iter_mixed` 用 `os.path.exists` 兜住英文
-> 文件、拿空迭代器顶上，于是脚本正常跑完、语料行照常打印，产出的是一个**英文盲的
-> 编码器**。新克隆的人离这个结果只差一条忘掉的命令。（tokenizer 的压缩率门槛大概率
-> 会拦下它；它下游的任何一步都不会。）
+> **缺失语料现在明确报错，不静默跳过。** 下方两个本地路径必须有可用数据。
+> `--allow_missing_corpus` 只允许显式少一路并报告组成变化，不算完整复现；空文件或
+> 损坏记录仍报错。无需外部语料的教学流程请使用 `scripts/quickstart.py`。
 
 ### 1. Tokenizer
 
 ```bash
-python trainer/train_tokenizer.py
+python trainer/train_tokenizer.py --pretrain_path dataset/pretrain_zh.jsonl \
+    --en_path dataset/pretrain_en.jsonl
 ```
 
 新建 BPE（vocab 6400），训练语料 = 预训练语料 **∪ 合成决策语料**。
@@ -607,9 +652,31 @@ split 按 **`template_id` × `entity_pool` 划分，绝不随机逐条划分。*
 ### 3. 训练
 
 ```bash
-python trainer/train_mlm.py                                   # Stage 1：编码器
-python trainer/train_decision.py --encoder out/mlm/mlm.pth    # Stage 2：决策
+python trainer/train_mlm.py --pretrain_path dataset/pretrain_zh.jsonl \
+    --en_path dataset/pretrain_en.jsonl --num_workers 0 --save_optimizer
+python trainer/train_decision.py --encoder out/mlm/mlm.pth \
+    --num_workers 0 --save_optimizer
 ```
+
+从最近的完整保存点继续时，保持**相同训练参数**，去掉仅用于初始化的
+`--encoder`/`--init_checkpoint` 后加 `--resume`；不要改变数据/词表、batch/accum、epochs 或学习率计划：
+
+```bash
+python trainer/train_mlm.py --pretrain_path dataset/pretrain_zh.jsonl \
+    --en_path dataset/pretrain_en.jsonl --num_workers 0 --save_optimizer \
+    --resume out/mlm/mlm_opt.pth
+python trainer/train_decision.py --num_workers 0 --save_optimizer \
+    --resume out/decision/decision_opt.pth
+```
+
+`--encoder` 是 MLM 编码器初始化；同阶段权重初始化属于**新训练**；
+`--resume ..._opt.pth` 才恢复完整状态。需新版完整保存文件，不能用旧 optimizer-only
+文件或推理权重冒充恢复。精确恢复目前要求 workers=0；恢复的是最后保存点，不是崩溃
+瞬间未保存的计算，也不保证跨硬件/版本逐比特相同。
+`--max_steps` 是绝对总更新预算；`--stop_after_steps` 只暂停本次运行，不缩短学习率计划。
+恢复时去掉暂停选项，而不是把总预算当作额外训练步数。
+训练选项保留名称：`--lambda_brier` 加权 distribution L2，`--brier_normalize`
+将每条平方损失除以有效候选数。
 
 ### 4. 校准与评测
 
@@ -621,8 +688,7 @@ python eval/eval_harness.py --ckpt out/decision/decision.pth \
     --data dataset/synth --sets test_known \
     --temperature out/calibration/T.json --out out/eval/decision
 
-# 真实文本那一跑，用的是公开集。**这里不给 `--temperature`**：见下方注，
-# 合成集上拟合的温度迁移不过去。
+# 历史真实文本路线报告原始概率，没有测试温度迁移。
 python eval/eval_harness.py --ckpt out/decision/decision.pth \
     --data dataset/public --sets test_known --out out/eval/public
 
@@ -630,18 +696,16 @@ python eval/make_reliability_plot.py \
     --eval out/eval/decision/decision --sets test_known --binning equal_mass \
     --out assets
 
-# 人类分歧那一张。`--source` 是必需的：`human_annotators` 这个 provenance 同时
-# 盖住 ChaosNLI（N≈100）与 GoEmotions（N=3–5），两者的噪声底差一个数量级以上，
-# 合成一根柱子度量的是混合比例而不是校准。
+# 按 source 选择 ChaosNLI，便于和 GoEmotions 的任务/标注协议分别解释。
 python eval/make_reliability_plot.py \
     --eval out/eval/public/decision --sets test_known \
     --source public:chaosnli --binning equal_mass --out assets
 ```
 
-> **不要把合成集上拟合的温度套到 ChaosNLI 上。** 两个集的 logit 分布不同，而 `T`
-> 是从 `test_known` 那类样本的置信度分布里拟合出来的。真实集上的正确做法是单独在
-> 它自己的 dev split 上拟合，或者直接报未校准的原始 ECE。混用会产出一个好看但错误
-> 的数字。
+> **温度迁移必须实测。** 合成 calib 温度可能改善也可能恶化真实文本指标；历史原始
+> 概率路线没有测试它。做本域校准应在独立本域 calib/dev 拟合，冻结后测试；明确标记的
+> 跨域迁移实验也合法。标量温度是动态候选下简单、置换等变的选择，不是唯一可迁移
+> 的参数化，更不保证新 schema 已校准。
 
 `calibrate_temperature.py` 写出的 `T.json` 里含 **checkpoint 与 tokenizer 的 SHA1**，
 因为温度是绑定到具体权重的 —— 否则来自另一个模型的 `T.json` 会被静默接受并照常出图。
@@ -652,9 +716,9 @@ python eval/make_reliability_plot.py \
 
 两条都在开发中实测踩过，且都属于"看起来完全是别的问题"的那类失败。
 
-1. **`import datasets`（pyarrow）必须先于 `import torch`。** 反过来的话进程会静默消失
-   —— 退出码 139，零输出，没有 traceback。`train_mlm.py` 里保留 MiniMind 原样的
-   `import datasets  # noqa: F401` 就是这个原因。
+1. **历史 pyarrow/Torch 导入顺序故障。** 早期 Windows 环境出现过反向导入时退出码
+   139、无 traceback 的问题。当前固定环境已经跑通 quickstart，不能据此推广成普遍的
+   导入顺序规则；当前 `train_mlm.py` 也没有占位的 `import datasets`。
 
 2. **7.5–8 GB 附近有一个显存悬崖，而且它不崩。** Windows WDDM 在显存不足时把页面
    换到共享内存，而不是抛 OOM：实测 32×1024 的配置**不会** OOM，只是**慢 10 倍**

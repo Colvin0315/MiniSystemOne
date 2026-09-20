@@ -9,19 +9,16 @@ reproduction" 一节。
 
 ## 为什么对比要做在合成集上
 
-判决性的指标是 **ECE —— 对着已知 P***。只有合成集有精确的条件分布（`explicit_rng`
-的银行 RNG、`tie_set` 的并列集、`marginalized` 的边缘化）；公开集上的 target 是
-有限个标注者投出来的，噪声底本身就压过了要测的差异。
+合成集有可直接检查的目标分布（`explicit_rng`、`tie_set`、`marginalized`）。
+公开集的人工频率受有限标注影响，但硬标签和人工频率同样能用于校准评测。
 
-**代价必须写明：ours 是在这个分布上训出来的，另两个是零样本。** 所以准确率这一列
-对我们有利，不能当作"我们更准"的证据。这张表要读的是 ECE、Brier、延迟，以及
-LLM 的 schema 错误率 —— 那几列没有这个问题。
+**代价必须写明：ours 是在这个分布上训出来的，另两个是零样本。**
+这会影响准确率和概率指标，不能从本表推广出系统能力排名。
 
 ## 指标口径
 
-三个模型都产出"候选顺序上的分布"，然后**全部交给 `eval.eval_metrics` 的同一份
-`soft_accuracy` / `ece` / `brier`**。不在这里另写一份评分代码：两份实现迟早漂移，
-而漂移方向通常是"自己想展示的那个赢"。
+三个模型都产出候选顺序上的分布，由同一份 `eval.eval_metrics` 计算
+`soft_accuracy` / `ece` / `distribution_l2` / `expected_brier`。
 
 用法：
     export TYPESAFE_API_KEY=...
@@ -43,7 +40,7 @@ from transformers import AutoTokenizer
 
 from dataset.decision_dataset import DecisionDataset
 from eval.eval_inference import collect
-from eval.eval_metrics import brier, ece, soft_accuracy
+from eval.eval_metrics import distribution_l2, expected_brier, ece, soft_accuracy
 from trainer.trainer_utils import unbuffer_stdout
 
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
@@ -251,7 +248,8 @@ def score(probs, records, tag):
         # `soft_accuracy` 返回的是**逐样本**数组（见 eval_metrics:118），不是标量。
         "soft_acc": float(np.mean(soft_accuracy(Pm, Tm, Mk))),
         "ece": float(ece(Pm, Tm, Mk, BINS, "equal_mass")),
-        "brier": float(brier(Pm, Tm, Mk)),
+        "distribution_l2": float(distribution_l2(Pm, Tm, Mk)),
+        "expected_brier": float(expected_brier(Pm, Tm, Mk)),
         "by_source": {
             src: {
                 "n": int(sum(1 for i in keep if records[i]["source"] == src)),
@@ -308,7 +306,7 @@ def main():
         print(f"  {ms:.1f} ms/条  {meta}  共 {time.time()-t0:.0f}s")
 
     print("\n========== 结果（同一份 eval_metrics 打分）==========")
-    print(f"  {'系统':<10} {'n':>4} {'剔除':>5} {'软准确率':>9} {'ECE':>8} {'Brier':>8} {'ms/条':>8}")
+    print(f"  {'系统':<10} {'n':>4} {'剔除':>5} {'软准确率':>9} {'ECE':>8} {'Dist L2':>8} {'E[Brier]':>9} {'ms/条':>8}")
     summary = {}
     for tag, r in results.items():
         s = score(r["probs"], records, tag)
@@ -317,7 +315,7 @@ def main():
             continue
         summary[tag] = {**s, "ms_per_item": r["ms_per_item"], "meta": r["meta"]}
         print(f"  {tag:<10} {s['n']:>4} {s['dropped']:>5} {s['soft_acc']:>9.4f} "
-              f"{s['ece']:>8.4f} {s['brier']:>8.4f} {r['ms_per_item']:>8.1f}")
+              f"{s['ece']:>8.4f} {s['distribution_l2']:>8.4f} {s['expected_brier']:>9.4f} {r['ms_per_item']:>8.1f}")
 
     print("\n  逐来源软准确率：")
     for tag, s in summary.items():

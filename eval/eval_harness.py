@@ -3,7 +3,7 @@
 
 输出 `out/eval/<ckpt>/<set>.json`，含四块：
 
-  - `metrics`     未校准的 per-provenance 指标（`all` / `calibration` / 每个 provenance）
+  - `metrics`     未校准的 per-provenance 指标（`all` / `soft_targets` / 每个 provenance）
   - `calibrated`  温度校准后的同一套指标，**三种粒度各一份**（global / primitive /
                   primitive_k）。三数并列比一句断言更有信息量 —— 如果 global 一个
                   标量就能追平 15 个桶，那"per-(primitive×K) 温度"就不是必需的复杂度。
@@ -33,15 +33,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer
 
 from dataset.decision_dataset import DecisionDataset
-from eval.eval_inference import collect, counts_array, effective_k
+from eval.eval_inference import collect, counts_array, effective_k, load_decision, load_temperature
 from eval.eval_metrics import apply_temperature, metrics_by_provenance, top1
-from model.model_system_one import DecisionConfig, MiniSystemOneForDecision
-from trainer.trainer_utils import (
-    init_model, peak_vram_warn, unbuffer_stdout, verify_tokenizer,
-)
+from trainer.trainer_utils import peak_vram_warn, unbuffer_stdout
 
 SETS = ("val", "calib", "test_known", "test_ood")
 GRANULARITIES = ("global", "primitive", "primitive_k")
@@ -62,10 +58,10 @@ def parse_args():
                    help="out/calibration/T.json；不给则只报未校准指标")
     p.add_argument("--apply", default="primitive_k", choices=GRANULARITIES,
                    help="per_sample.p_calibrated 用哪一档温度")
-    p.add_argument("--max_len", type=int, default=1024)
-    p.add_argument("--hidden_size", type=int, default=512)
-    p.add_argument("--num_hidden_layers", type=int, default=8)
-    p.add_argument("--crosstalk", action="store_true")
+    p.add_argument("--max_len", type=int)
+    p.add_argument("--hidden_size", type=int)
+    p.add_argument("--num_hidden_layers", type=int)
+    p.add_argument("--crosstalk", action="store_true", default=None)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--limit", type=int, default=0, help="每个 set 只用前 N 条（0=全部）")
     p.add_argument("--no_per_sample", action="store_true",
@@ -143,24 +139,14 @@ def main():
     if device == "cpu":
         raise SystemExit("本项目的所有实测数字都基于 GPU；--device cpu 不在支持范围内。")
 
-    temp = None
-    if args.temperature:
-        with open(args.temperature, encoding="utf-8") as f:
-            temp = json.load(f)
-        print(f"温度 {args.temperature}："
-              f"global={temp.get('global')}  段={[k for k in GRANULARITIES if k in temp]}")
-
-    tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    # 权重与词表不配套是**静默**失败：vocab 都是 6400，载入不报错，指标全是噪声。
-    verify_tokenizer(args.ckpt, args.tokenizer)
-    config = DecisionConfig(
-        hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-        vocab_size=len(tok), candidate_crosstalk=args.crosstalk,
-        pad_token_id=tok.convert_tokens_to_ids("<pad>"),
-        sep_token_id=tok.convert_tokens_to_ids("<sep>"),
+    temp = (load_temperature(args.temperature, args.ckpt, args.tokenizer)
+            if args.temperature else None)
+    tok, model, meta = load_decision(
+        args.ckpt, args.tokenizer, device, hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers, candidate_crosstalk=args.crosstalk,
     )
-    model = init_model(MiniSystemOneForDecision, config, args.ckpt, device)
-    model.eval()
+    config = model.config
+    args.max_len = args.max_len or meta.get("max_len", 1024)
 
     stem = os.path.splitext(os.path.basename(args.ckpt))[0]
     out_dir = os.path.join(args.out, stem)
@@ -174,7 +160,7 @@ def main():
         "tokenizer_sha1": sha1_of(os.path.join(args.tokenizer, "tokenizer.json")),
         "n_params": sum(p.numel() for p in model.parameters()),
         "max_len": args.max_len,
-        "crosstalk": args.crosstalk,
+        "crosstalk": config.candidate_crosstalk,
         "prefix_blocked": config.prefix_blocked,
         "bins": args.bins,
         "binning": args.binning,
@@ -204,9 +190,13 @@ def main():
         calibrated = {}
         if temp is not None:
             for gran in GRANULARITIES:
+                if gran != "global" and not temp.get(gran):
+                    continue
                 pg = apply_temperature(col["p"], temp, col["primitive"], k,
                                        col["mask"], gran)
                 calibrated[gran] = metrics_for(col, pg, args)
+            if args.apply not in calibrated:
+                raise ValueError(f"温度文件没有 {args.apply}，请显式选择 --apply global")
             p_cal = apply_temperature(col["p"], temp, col["primitive"], k,
                                       col["mask"], args.apply)
 
@@ -244,19 +234,19 @@ def main():
         a = raw["all"]
         print(f"\n  {name}  n={col['n']}  K_used max {int(k.max())}  ({time.time()-t0:.0f}s)")
         print(f"    未校准      acc {a['accuracy']:.3f}  ECE {a['ece']:.4f}  "
-              f"Brier {a['brier']:.4f}  NLL {a['nll']:.4f}")
+              f"distribution_l2 {a['distribution_l2']:.4f}  NLL {a['nll']:.4f}")
         for gran in GRANULARITIES:
             if gran not in calibrated:
-                break
+                continue
             g = calibrated[gran]["all"]
-            print(f"    温度/{gran:12s} ECE {g['ece']:.4f}  Brier {g['brier']:.4f}  "
+            print(f"    温度/{gran:12s} ECE {g['ece']:.4f}  distribution_l2 {g['distribution_l2']:.4f}  "
                   f"NLL {g['nll']:.4f}  (acc 不变 {g['accuracy']:.3f})")
-        if "calibration" in raw:
-            c = raw["calibration"]
-            print(f"    calibration 子集（剔除 hard） acc {c['accuracy']:.3f}  "
-                  f"ECE {c['ece']:.4f}  Brier {c['brier']:.4f}")
+        if "soft_targets" in raw:
+            c = raw["soft_targets"]
+            print(f"    soft_targets 子集 acc {c['accuracy']:.3f}  "
+                  f"ECE {c['ece']:.4f}  distribution_l2 {c['distribution_l2']:.4f}")
         for prov in sorted(raw):
-            if prov in ("all", "calibration"):
+            if prov in ("all", "soft_targets"):
                 continue
             m = raw[prov]
             print(f"      {prov:17s} n={m['n']:6d}  acc {m['accuracy']:.3f}  "

@@ -37,6 +37,7 @@ import json
 import os
 import random
 import sys
+from itertools import chain
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -48,28 +49,69 @@ GEN_VOCAB_WEIGHTS = {"tool_router": 3.0, "agent_trace_score": 1.5}
 
 
 def _read_jsonl(path, text_key):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            text = obj.get(text_key)
-            if text:
+    """Read strict UTF-8 JSONL; malformed or empty input is never a fallback."""
+    count = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"{path}:{line_no}: invalid JSON; repair this JSONL file "
+                        f"(expected {{\"{text_key}\": \"nonempty text\"}}).") from exc
+                text = obj.get(text_key) if isinstance(obj, dict) else None
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError(
+                        f"{path}:{line_no}: expected a nonempty string field "
+                        f"{text_key!r}; repair the corpus before training.")
+                count += 1
                 yield text
+    except UnicodeError as exc:
+        raise ValueError(f"{path}: invalid UTF-8; re-export the corpus as UTF-8 JSONL.") from exc
+    if not count:
+        raise ValueError(f"{path}: empty corpus; provide nonempty JSONL text records.")
+
+
+def _validate_sources(zh_path, en_path, zh_key, en_key, allow_missing_corpus):
+    sources = []
+    # Check all paths before scanning any large files or generating synthetic data.
+    for name, path, key in (("zh", zh_path, zh_key), ("en", en_path, en_key)):
+        if not path or not os.path.isfile(path):
+            if not allow_missing_corpus:
+                raise FileNotFoundError(
+                    f"Missing {name} corpus: {path!r}. Supply --pretrain_path / --en_path "
+                    "with local JSONL files, use --synthetic_only for the offline tutorial, "
+                    "or explicitly pass --allow_missing_corpus to permit missing sources.")
+            print(f"语料来源 {name}: {path!r} 缺失，按 --allow_missing_corpus 显式跳过")
+            sources.append(None)
+        else:
+            sources.append((path, key))
+    # Validate every selected file, including its tail, before slow synth generation.
+    # This is a streaming pass, not a second in-memory copy of the natural corpus.
+    for source in sources:
+        if source:
+            for _ in _read_jsonl(*source):
+                pass
+    return sources
 
 
 def iter_mixed(zh_path=None, en_path=None, max_docs=200000, en_share=0.5,
-               zh_key="text", en_key="text"):
+               zh_key="text", en_key="text", allow_missing_corpus=False):
     """按**字符预算**混合中英语料，而非按文档数 —— 两种语言的字节密度差 3 倍。
 
     en_share 是英文应占的字符比例。每次取当前占比低于目标的那一路，
     所以是自校正的：任一路提前耗尽也不会让比例崩掉。
     """
-    zh = _read_jsonl(zh_path, zh_key) if zh_path and os.path.exists(zh_path) else iter(())
-    en = _read_jsonl(en_path, en_key) if en_path and os.path.exists(en_path) else iter(())
+    if max_docs < 0 or not 0 <= en_share <= 1:
+        raise ValueError("max_docs must be nonnegative and en_share must be in [0, 1].")
+    sources = _validate_sources(zh_path, en_path, zh_key, en_key, allow_missing_corpus)
+    zh, en = (_read_jsonl(*source) if source else iter(()) for source in sources)
     zh_done = en_done = False
     zh_chars = en_chars = 0
+    zh_docs = en_docs = 0
     n = 0
 
     while n < max_docs and not (zh_done and en_done):
@@ -91,14 +133,18 @@ def iter_mixed(zh_path=None, en_path=None, max_docs=200000, en_share=0.5,
 
         if take_en:
             en_chars += len(text)
+            en_docs += 1
         else:
             zh_chars += len(text)
+            zh_docs += 1
         n += 1
         yield text
 
     total = max(zh_chars + en_chars, 1)
-    print(f"语料混合：{n} 篇，中文 {zh_chars/1e6:.1f}M 字 ({100*zh_chars/total:.0f}%) "
-          f"+ 英文 {en_chars/1e6:.1f}M 字符 ({100*en_chars/total:.0f}%)")
+    print(f"语料混合：{n} 篇，中文 {zh_docs} 篇 ({zh_path}) "
+          f"{zh_chars/1e6:.1f}M 字 ({100*zh_chars/total:.0f}%) "
+          f"+ 英文 {en_docs} 篇 ({en_path}) "
+          f"{en_chars/1e6:.1f}M 字符 ({100*en_chars/total:.0f}%)")
 
 
 def render_doc(rec):
@@ -131,15 +177,27 @@ def iter_synth_docs(n_docs, seed=0):
     state 的压缩率（下面 `tok_probe.py` 量的那个）是唯一会被它损害的指标，所以
     加权重之后必须复测它。
     """
+    if n_docs < 0:
+        raise ValueError("n_docs must be nonnegative.")
+    if n_docs == 0:
+        return
+
     from dataset.synth import build_all
 
     gens = build_all(seed=seed)
     rng = random.Random(seed)
     weights = [GEN_VOCAB_WEIGHTS.get(g.name, 1.0) for g in gens]
     total_w = sum(weights)
+    # Largest-remainder allocation avoids rounding down the requested total.
+    quotas = [n_docs * w / total_w for w in weights]
+    counts = [int(q) for q in quotas]
+    order = sorted(range(len(gens)), key=lambda i: quotas[i] - counts[i], reverse=True)
+    for i in order[:n_docs - sum(counts)]:
+        counts[i] += 1
     pool = []
-    for g, w in zip(gens, weights):
-        pool.extend(g.generate("train", max(1, round(n_docs * w / total_w))))
+    for g, count in zip(gens, counts):
+        if count:
+            pool.extend(g.generate("train", count))
     rng.shuffle(pool)
     for rec in pool[:n_docs]:
         yield render_doc(rec)
@@ -161,20 +219,48 @@ def iter_corpus(args):
     模板重复度极高，占比过高会挤掉自然语言统计）。所以 tokenizer 用 60k、MLM 用
     20k。共享的是插入算法，不是那个数字。
     """
+    if args.n_docs < 0 or args.n_synth < 0:
+        raise ValueError("--n_docs and --n_synth must be nonnegative.")
+    if not 0 <= args.en_share <= 1:
+        raise ValueError("--en_share must be in [0, 1].")
+    synthetic_only = getattr(args, "synthetic_only", False)
+    if synthetic_only:
+        if not args.n_synth:
+            raise ValueError("--synthetic_only requires --n_synth > 0.")
+        print("synthetic_only：仅使用双语 train 模板语料演示流程，不替代自然语言预训练。")
+        natural = iter(())
+    else:
+        if not args.n_docs:
+            raise ValueError("Natural corpus mode requires --n_docs > 0; "
+                             "use --synthetic_only for synthetic-only training.")
+        natural = iter_mixed(
+            args.pretrain_path, args.en_path, max_docs=args.n_docs,
+            en_share=args.en_share,
+            allow_missing_corpus=getattr(args, "allow_missing_corpus", False))
+        # iter_mixed is lazy: prime it to validate sources BEFORE synth generation.
+        first = next(natural, None)
+        natural = chain((first,), natural) if first is not None else natural
+        if first is None and not args.n_synth:
+            raise ValueError("No usable corpus remains; supply local JSONL or "
+                             "use --synthetic_only with --n_synth > 0.")
+
     rng = random.Random(args.seed)
     synth = list(iter_synth_docs(args.n_synth, seed=args.seed))
     rng.shuffle(synth)
-
     every = max(1, args.n_docs // max(args.n_synth, 1))
-    n_pre = 0
-    for doc in iter_mixed(args.pretrain_path, args.en_path, max_docs=args.n_docs,
-                          en_share=args.en_share):
-        yield doc
+    n_pre = n_synth = 0
+    for doc in natural:
         n_pre += 1
+        yield doc
         if n_pre % every == 0 and synth:
+            n_synth += 1
             yield synth.pop()
-    yield from synth                      # 预训练语料不足时把合成语料补完
-    print(f"语料构成：中英混合 {n_pre} 篇 + 合成 {args.n_synth - len(synth)} 篇")
+    while synth:
+        n_synth += 1
+        yield synth.pop()
+    if not n_pre + n_synth:
+        raise ValueError("Corpus produced no documents; check source files and --n_synth.")
+    print(f"语料构成：中英混合 {n_pre} 篇 + 合成 {n_synth} 篇")
 
 
 # ---------------------------------------------------------------------------

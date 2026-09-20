@@ -237,8 +237,7 @@ class DecisionDataset(Dataset):
             "id": rec.get("id"),
             "source": rec.get("source"),
             "provenance": rec["target"].get("provenance"),
-            # 标注者人数（仅 human_annotators 有）。`binomial_noise_floor` 需要它，
-            # 而它**不是**模型输入，所以只随元信息走。
+            # 标注数用于假设标注模型下的 MC 参考量，不参与训练。
             "counts": rec["target"].get("counts"),
             "gen_version": rec.get("gen_version"),
             "template_id": rec.get("meta", {}).get("template_id"),

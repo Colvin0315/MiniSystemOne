@@ -1,19 +1,4 @@
-"""
-ChaosNLI —— 全套里**唯一**能把逐条 ECE 压到二项噪声底之上的数据。
-
-为什么是它：MNLI 的每条样本有约 100 个标注者，所以 `label_dist` 是一个**真实人类
-分歧分布**，而不是"程序规定的分布"。合成生成器给得出已知的 P*，但那是程序的；真实
-人类标注的 P* 只有真实语料里有。README 的头条校准数字就来自这里。
-
-数据集用的是 HF 镜像 `metaeval/chaos-mnli-ambiguity`（1599 条）—— 原 Dropbox 链接
-（2020 年发布）已失效，返回的是 "File Deleted" 的 HTML 页，不是压缩包。
-
-**它没有原生 split**，所以按整桶哈希切分（见 `dataset/adapters/__init__.py` 里
-`N_BUCKETS` 的注释：逐条决定 split 会让同一个组合同时落在 train 和 test_known 里）。
-
-**标注数 N 会记进 `audit`**：`eval_metrics.binomial_noise_floor` 需要它才能算出
-"同样本数下理想校准模型的期望 ECE"。不记的话，报告里的噪声校正就无从下手。
-"""
+"""ChaosNLI empirical annotation distributions; finite frequencies are not exact P*."""
 from dataset.adapters import PublicAdapter, sec
 
 # `label_dist` 的分量顺序是 [e, n, c]。这一条容易搞反 —— "contradiction" 的首字母是
@@ -96,8 +81,7 @@ class ChaosNLI(PublicAdapter):
             if sum(vals) <= 0:
                 continue
             p = _normalize(vals)
-            # 标注者总数取 label_count 的和，不是 label_counter 的和 —— 两者一致时无
-            # 差别，不一致时前者与 label_dist 同源，噪声底的算法要用的是同一个数。
+            # Use the annotation counts from the same source as label_dist.
             n_ann = int(round(sum(float(x) for x in counts))) or int(round(sum(vals)))
 
             # key 用数据集自带的 `uid`：它稳定、唯一，且与行号无关。用行号的话，
@@ -117,11 +101,7 @@ class ChaosNLI(PublicAdapter):
                 "provenance": self.provenance,
                 "target": {"kind": "soft", "p": p, "provenance": self.provenance,
                            "renormalized": False,
-                           # `counts` 是 `binomial_noise_floor` 的唯一输入，而噪声底是
-                           # 这个项目校准报告的必需项（见 docs/CALIBRATION.md §6）。
-                           # 只写进 `audit` 是不够的：audit 是给人看的，`counts` 才
-                           # 是 `DecisionDataset` 读的那个字段 —— 不写它，地板的计算
-                           # 会静默跳过，报告里那行"噪声校正后 ECE"直接消失。
+                           # Counts describe annotation uncertainty, not an ECE lower bound.
                            "counts": n_ann,
                            "audit": {"n_annotators": n_ann,
                                      "entropy": _f(row.get("entropy")),

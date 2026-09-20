@@ -3,12 +3,60 @@
 > **Train a probabilistic decision model from scratch — no LLM, no decoding, no JSON generation.**
 
 A ~27M-parameter model that takes a **state** plus **typed questions** and returns
-**typed decisions with calibrated probabilities** — in a single parallel forward pass.
+**typed decisions with candidate probabilities** — in a single parallel forward pass.
+Calibration is an empirical property to evaluate, not a guarantee of the architecture.
 No autoregressive loop, no text output, no constrained-decoding tricks.
 
 Built from random initialization, MiniMind-style: one shared bidirectional encoder,
-one decision head, one loss. Every number in this README is reproducible from this
-repository on a single 8 GB laptop GPU.
+one decision head, one loss. Historical full-scale measurements below used a single
+8 GB laptop GPU and the original corpora; they are not quickstart results or a guarantee
+for other hardware or replacement datasets.
+
+## Start here: three routes
+
+Run commands from the repository root in the environment from [Reproducing](#reproducing).
+Model training/inference uses CUDA (no CPU fallback in the recommended route). There is
+**no published weights download URL** here; weights and their matching tokenizer must exist locally.
+
+1. **Use local weights.** If you already ran quickstart, try a label-free request:
+   ```bash
+   python inference.py --ckpt out/quickstart/decision/decision.pth --tokenizer out/quickstart/tokenizer --input examples/inference/choice.json
+   # Optional: apply the matching temperature artifact
+   python inference.py --ckpt out/quickstart/decision/decision.pth --tokenizer out/quickstart/tokenizer --input examples/inference/choice.json --temperature out/quickstart/calibration/T.json
+   ```
+   Replace `choice.json` with `noul.json` or `score.json` for the other primitives.
+   Without `--temperature`, output is explicitly uncalibrated. Other local checkpoints
+   require their own matching tokenizer and temperature; a CLI JSON response is not
+   autoregressive JSON generation by the model.
+2. **Train an offline toy model from scratch.** With dependencies installed:
+   ```bash
+   python scripts/quickstart.py
+   ```
+   Uses bilingual synthetic train templates, a small h128/L2 model and 20 updates per
+   training stage; runs tokenizer → data → MLM → decision → calibration → held-out
+   evaluation → three inference examples. Outputs stay in `out/quickstart/`; existing
+   outputs are not silently overwritten. It skips the formal tokenizer compression
+   gate explicitly, not special-token validation. This teaches the pipeline, **not
+   business quality or reproduction of the historical 26.89M tables**.
+3. **Reproduce the full experiment.** Follow [Reproducing](#reproducing): acquire the
+   natural-language corpora yourself, prepare `dataset/pretrain_zh.jsonl` and
+   `dataset/pretrain_en.jsonl`, and run the full stages. Source acquisition is not
+   magically done by training commands; replacing the corpus is a new experiment.
+
+Measured quickstart on RTX 4070 Laptop: **90.5 seconds** for all stages, using
+[the checked-in configuration](configs/quickstart.json); MLM length 256 and decision
+length 2048 retain large candidate sets. Peak allocated training tensors were 0.097 GB
+(MLM) / 0.210 GB (decision), **not total device memory**. The 96-row test accuracy was
+29.2%; this is pipeline evidence, not business quality. See [measured results](results/quickstart.json).
+No other GPU memory tiers were tested.
+
+Next: [Your first custom task](docs/FIRST_TASK.md), a customer-service tool router with
+human handoff. A new schema/candidate list does not mean a new task has been learned.
+Under default independent scoring, at fixed state/question and temperature,
+`p_i/p_j = exp((s_i-s_j)/T)` does not depend on other candidates: adding one changes
+normalization, not the old pairwise ratio. That limits set-dependent reasoning.
+Low binned ECE is neither per-request correctness nor an OOD safety guarantee.
+
 
 ---
 
@@ -47,10 +95,10 @@ chat models.
 - **One encoder, one head, one loss.** Noul, Choice and Score are not three code paths.
   They are one softmax over a candidate set: Noul is `{yes, no}`, Score is `{1..5}`.
   Abstention is a candidate, not a branch.
-- **Calibration is the point, so the data has to contain it.** One-hot labels cannot teach
-  a model to be calibrated — a Brier loss on one-hot targets is just a confidence-pushing
-  regularizer. The synthetic generators here emit targets whose **true conditional
-  distribution is known**, which is what makes ECE measurable instead of decorative.
+- **Calibration needs measurement.** Hard-label cross-entropy and Brier are proper
+  scoring rules and can learn conditional probabilities in expectation. Soft targets
+  are not required; our known synthetic distributions make direct supervision and
+  distribution-level checks easier.
 - **Honest by construction.** Where this project's own projection turned out wrong
   (per-question amortization, latency), the README says so and strikes it out. Where the
   model fails (real text, OOD), the number is reported rather than buried.
@@ -112,19 +160,27 @@ in [`docs/DATA_SCHEMA.md`](docs/DATA_SCHEMA.md).
 
 ### Why calibration is the whole point
 
-**One-hot labels cannot teach calibration.** A Brier loss on one-hot targets is just
-a confidence-pushing regularizer: it can never teach a model that "when I say 0.8, I
-should be right 80% of the time," because the training signal contains no information
-about 0.8.
+**Hard labels can teach and evaluate calibration.** The expected cross-entropy and
+observed multiclass Brier are minimized at the true conditional distribution. A single
+one-hot observation does not reveal that distribution, but empirical learning across
+samples can estimate it. Soft labels are convenient, not necessary.
 
-So the training data has to contain samples whose **true conditional distribution is
-known**. This repo builds them three ways — a known randomized rule (`explicit_rng`),
-marginalization over a hidden variable exposed only coarsely in the state
-(`marginalized`), and genuinely tied answer sets (`tie_set`) — and, for real human
-disagreement, from ChaosNLI's ~100 annotations per item (`human_annotators`).
+This repo builds directly checkable targets three ways — a known randomized rule
+(`explicit_rng`), marginalization over a hidden variable exposed only coarsely in the
+state (`marginalized`), and defined tied answer sets (`tie_set`). ChaosNLI's ~100
+annotations per item (`human_annotators`) provide empirical frequencies, not guaranteed
+true conditional probabilities.
 
-Every metric is reported **bucketed by provenance**, because mixing sources with
-different irreducible noise floors makes ECE meaningless.
+Report the overall population and provenance groups with their composition. Binned
+**top-label ECE** compares confidence with mean `t[argmax p]`; it does not prove per-row
+distribution accuracy or OOD understanding. See [the metric contract](docs/CALIBRATION.md).
+New outputs use `distribution_l2` (mean over samples of the **sum** of classwise squared
+differences), `expected_brier = distribution_l2 + mean(1-sum(t**2))`, and `soft_targets`
+in place of the old `brier` and `calibration` aggregate. No legacy aliases are emitted.
+`ece_annotation_reference` replaces the old noise-floor diagnostic with an explicitly
+assumption-dependent MC reference; `ece_corrected` is removed. It must not be subtracted
+from ECE. Old tables below retain their actual distances as distribution L2; historical
+expected Brier was not measured and is not filled in.
 
 ---
 
@@ -140,32 +196,30 @@ estimated.
 
 ### Calibration on synthetic held-out data
 
-`test_known`, n=18,000, K up to 255. `hard` is excluded from the calibration row
-(`metrics.calibration`) because one-hot targets carry no information about how uncertain
-the world is — pooling them in dilutes ECE toward "looks good".
+`test_known`, n=18,000, K up to 255. The `soft_targets` row (historically
+`metrics.calibration`) excludes hard targets to describe that subset, not because hard
+labels cannot measure calibration. Overall and subgroup metrics answer different questions.
 
-| | acc | ECE | Brier | NLL |
+| | acc | ECE | distribution L2 | NLL |
 |---|---|---|---|---|
 | uncalibrated | 0.647 | 0.0047 | 0.0249 | 1.0821 |
 | global temperature | 0.647 | 0.0038 | 0.0249 | 1.0821 |
 | per-(primitive × K) temperature | 0.647 | 0.0046 | 0.0248 | 1.0800 |
-| **calibration subset** (hard excluded, n=16,361) | **0.612** | **0.0061** | 0.0273 | — |
+| **soft_targets subset** (hard excluded, n=16,361) | **0.612** | **0.0061** | 0.0273 | — |
 
 ![synthetic reliability](assets/reliability_synth_test_known.png)
 
-**The temperature has almost nothing to fix.** Fitted `T = 0.965`, and NLL moves
-1.0629 → 1.0628. That is the intended result: the model is *natively* calibrated because
-its targets were distributions to begin with, not one-hot labels smoothed after the fact.
-Temperature calibration is reported here mainly to show it is a no-op.
+**Temperature has little effect in this historical fit.** `T = 0.965` and NLL moves
+1.0629 → 1.0628. This reports a small benefit for this distribution, not proof of
+per-row calibration or evidence that one-hot training cannot calibrate.
 
 ### Read this table, not the accuracy column
 
-`accuracy` pools two kinds of sample whose ceilings are structurally different, so it
-measures the provenance mix more than the model. On a `tie_set` record the target is
-uniform over the valid answers, so `t[argmax p]` is capped at `1/k` **no matter how good
-the model is**. On a one-hot record the same number is a real accuracy. The honest
-denominator is the **oracle ceiling**: for a perfectly calibrated model `p* = t`, so its
-soft-accuracy is exactly `mean(max_k t_k)` — computable from the data with no model at all.
+The `accuracy` column is argmax agreement (with a first-index tie rule), not the same
+as `accuracy_soft = mean(t[argmax p])`. On `tie_set`, soft correctness is at most `1/k`;
+on one-hot targets it is observed accuracy. The table below reports soft correctness
+against the target-defined oracle ceiling `mean(max_k t_k)`. Overall scores depend on
+composition, so per-source results help interpret them.
 
 | source | n | model | oracle ceiling | achieved |
 |---|---|---|---|---|
@@ -205,20 +259,22 @@ the reading that survives scrutiny.
 
 ![chaosnli reliability](assets/reliability_public_test_known_public-chaosnli.png)
 
-474 items, N≈100 annotators each. **ECE 0.0613**, binomial noise floor **0.0068**,
-noise-corrected **0.0545**. The floor explains only 11% of it: on real text the model is
-genuinely miscalibrated, and no noise correction rescues that claim. The temperature panel
-is a no-op by design — the synthetic `T` does not transfer, and applying it here would
-produce a pretty wrong number.
+474 items, N≈100 annotators each. Historical **ECE 0.0613** and annotation MC reference
+**0.0068** are retained. The old subtraction **0.0545** is recorded only as a withdrawn
+interpretation, **not corrected ECE**. The reference assumes independent annotations and
+confidence equal to true top-label probability; it is not a universal noise lower bound.
+Old embedded images may retain superseded floor/correction labels; regenerate them with
+the current plot script. The right panel applies no temperature and therefore says
+nothing about whether synthetic-to-real temperature transfer succeeds.
 
-**Do not read the pooled `human_annotators` figure (ECE 0.3167).** It averages ChaosNLI
-with GoEmotions, whose 3–5 annotators quantize targets to multiples of 1/3…1/5 (GoEmotions
-alone: ECE 0.3253, floor 0.0044). The pooled number measures the mixing ratio, which is
-exactly why `--source` is mandatory for this figure.
+The pooled `human_annotators` ECE **0.3167** describes its particular mixture, not each
+source. Report ChaosNLI and GoEmotions separately as well: GoEmotions has 3–5 annotators,
+with historical ECE **0.3253** and MC reference **0.0044**. Mixed metrics are legitimate
+when the composition and purpose are explicit; neither MC quantity should be deducted.
 
 ### Synthetic → real gap
 
-**0.612 → 0.424 soft-accuracy** (synthetic calibration subset → ChaosNLI / GoEmotions on
+**0.612 → 0.424 soft-accuracy** (synthetic soft_targets subset → ChaosNLI / GoEmotions on
 real text). Roughly **19 points** of accuracy are lost crossing from program-generated rules
 to real natural language. Accuracy on the harder public splits — CLINC150, banking77,
 Amazon — is 0.157, close to but above chance.
@@ -268,7 +324,7 @@ states to be worth anything, and this data does not have them.
 `eval/compare_apis.py` — 48 items, stratified across the six generators, candidates ≤ 8,
 **the same inputs and the same `eval_metrics.py` scoring all three**.
 
-| system | n | dropped | soft-acc | **ECE** | Brier | **ms/item** | output tokens |
+| system | n | dropped | soft-acc | **ECE** | distribution L2 | **ms/item** | output tokens |
 |---|---|---|---|---|---|---|---|
 | **ours** | 48 | **0** | 0.5968 | **0.0248** | 0.0235 | **4.3** | **0** |
 | `jev-latest` | 48 | 0 | 0.5226 | 0.2164 | 0.2165 | 1464.6 | 2,781 |
@@ -290,12 +346,11 @@ states to be worth anything, and this data does not have them.
   second one.
 - **n = 48, eight per generator.** This shows a shape, not a citable number.
 
-What survives: the state renders all the evidence — `audit_synthetic.py`'s
-rendering-sufficiency check proves `P*` is **100% recoverable from the rendered text** —
-so all three systems see the same information. On that footing, Jev's reported
-probabilities sit **8.7× further from the true conditional distribution** than ours. That
-is the "ranking with a confidence gap" versus "calibrated distribution" distinction,
-measured rather than asserted.
+The rendering-sufficiency audit reported `P*` **100% recoverable from rendered text**,
+so the inputs expose the intended evidence. On this small historical sample, Jev's
+**distribution L2 (squared-distance sum)** was **8.7×** ours. This is a result for these
+inputs, not a general ranking or proof of calibration: ours was trained on this task
+family, and that advantage affects probability metrics as well as accuracy.
 
 Reproduce with `python eval/compare_apis.py` (opt-in; needs `TYPESAFE_API_KEY` and
 `DEEPSEEK_API_KEY`; **on no training or data-building path**; writes aggregate metrics
@@ -429,9 +484,9 @@ quietly adjusted to fit whatever comes out. It is a set of falsifiable predictio
   reported as the headline honesty number, not buried.
 - **Win on accuracy against a language model.** The claims are latency, native
   calibrated distributions, and **zero schema errors by construction** — not accuracy.
-- **Give reliable probabilities on genuinely OOD inputs.** No model does. The
-  ChaosNLI figure above *shows* the OOD calibration degradation (ECE 0.0613 against a
-  0.0068 noise floor) rather than claiming otherwise.
+- **Guarantee reliable probabilities on OOD inputs.** This project provides no such
+  guarantee. ChaosNLI's historical ECE 0.0613 is evidence about that evaluated set,
+  not a per-request guarantee or an OOD detection test.
 - **Replace an LLM in any sense.** It is a component. The framing of this README is
   "here is what a 26M decision-native model looks like and what it costs" — not
   "here is an LLM alternative."
@@ -551,12 +606,12 @@ trainer/
                           unbuffer_stdout
   train_tokenizer.py      Trains the BPE and enforces compression-rate gates
   train_mlm.py            Stage 1: MLM pretraining
-  train_decision.py       Stage 2: CE + λ_b·Brier + λ_o·CDF-MSE
+  train_decision.py       Stage 2: CE + λ_b·distribution L2 + λ_o·CDF-MSE
   calibrate_temperature.py  LBFGS on log T, three granularities
 eval/
-  eval_metrics.py         Pure functions: accuracy, nll, brier, ece, reliability_curve,
+  eval_metrics.py         Pure functions: accuracy, nll, distribution_l2, expected_brier, ece, reliability_curve,
                           risk_coverage_curve, ordinal_mae, expected_score,
-                          binomial_noise_floor, bootstrap_ci
+                          ece_annotation_reference, bootstrap_ci
   eval_harness.py         Writes metrics / by_provenance / per_sample
   eval_efficiency.py      Latency, throughput, VRAM, question amortization
   make_reliability_plot.py
@@ -614,14 +669,21 @@ the parameter counts in the table above.
 
 ```bash
 conda create -n minimind python=3.12
+conda activate minimind
 pip install -r requirements.txt
 ```
 
 ### 0. Corpus (one-time, needs network)
 
-`dataset/pretrain_en*.jsonl` is **not committed** — it is 61 MB of downloadable corpus.
-Rebuild it before anything else (~20 min). Training never touches the network; only this
-step does.
+`dataset/pretrain_en*.jsonl` is **not committed** — the historical English corpus was
+61 MB. The commands below fetch and blend Alpaca/Wikitext; they require network access.
+Chinese must be acquired separately: the original code default pointed to MiniMind's
+`pretrain_t2t_mini.jsonl` corpus in a sibling checkout. Obtain it from that
+project's documented sources under their terms and place/convert it at
+**`dataset/pretrain_zh.jsonl`**, one UTF-8 JSON object `{"text":"nonempty text"}` per line.
+No download URL for that local historical artifact is bundled or invented here. Verify
+its source/version yourself; a different corpus does not reproduce the old table.
+Tokenizer/MLM then consume these local files; they do not download them automatically.
 
 ```bash
 python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_alpaca.jsonl \
@@ -632,16 +694,16 @@ python dataset/pretrain_corpus.py fetch --out dataset/pretrain_en_wiki.jsonl \
 python dataset/pretrain_corpus.py blend --out dataset/pretrain_en.jsonl
 ```
 
-> **Skipping this does not fail — it silently degrades.** `iter_mixed` guards the English
-> file with `os.path.exists` and substitutes an empty iterator, so the run completes,
-> prints a normal-looking corpus line, and produces an **English-blind encoder**. A fresh
-> clone is one forgotten command away from that. (The tokenizer's compression gate will
-> likely catch it; nothing downstream of it will.)
+> **Missing corpora now fail explicitly.** Both local paths below must exist and contain
+> usable records. `--allow_missing_corpus` is an explicit opt-in to dropping a missing
+> source and reporting the change, not full reproduction; empty/malformed corpora still
+> fail. For a self-contained teaching run use `scripts/quickstart.py`, not silent skips.
 
 ### 1. Tokenizer
 
 ```bash
-python trainer/train_tokenizer.py
+python trainer/train_tokenizer.py --pretrain_path dataset/pretrain_zh.jsonl \
+    --en_path dataset/pretrain_en.jsonl
 ```
 
 A new BPE (vocab 6400) trained on the pretraining corpus **∪ the synthetic decision
@@ -673,9 +735,33 @@ is what makes `test_known` a real held-out set, and it is enforced by assertions
 ### 3. Train
 
 ```bash
-python trainer/train_mlm.py                                   # Stage 1: encoder
-python trainer/train_decision.py --encoder out/mlm/mlm.pth    # Stage 2: decisions
+python trainer/train_mlm.py --pretrain_path dataset/pretrain_zh.jsonl \
+    --en_path dataset/pretrain_en.jsonl --num_workers 0 --save_optimizer
+python trainer/train_decision.py --encoder out/mlm/mlm.pth \
+    --num_workers 0 --save_optimizer
 ```
+
+To resume from the last complete saved update, repeat the **same training arguments**,
+remove initialization-only `--encoder`/`--init_checkpoint`, and add `--resume`
+(do not change data/tokenizer, batch/accum, epochs or the LR plan):
+
+```bash
+python trainer/train_mlm.py --pretrain_path dataset/pretrain_zh.jsonl \
+    --en_path dataset/pretrain_en.jsonl --num_workers 0 --save_optimizer \
+    --resume out/mlm/mlm_opt.pth
+python trainer/train_decision.py --num_workers 0 --save_optimizer \
+    --resume out/decision/decision_opt.pth
+```
+
+`--encoder` initializes from MLM; same-stage weight initialization starts a **new**
+training run, while `--resume ..._opt.pth` restores complete training state. Use newly
+saved state files, not legacy optimizer-only files or inference weights. Exact resume
+currently requires workers=0; it restores the last checkpoint, not unsaved work at the
+instant of a crash, and does not promise bitwise identity across hardware/versions.
+`--max_steps` fixes the absolute total update budget; `--stop_after_steps` pauses the
+current invocation without shortening that schedule. Omit the pause flag on resume.
+The loss flags retain their names: `--lambda_brier` weights distribution L2 and
+`--brier_normalize` divides each sample's square loss by its valid candidate count.
 
 ### 4. Calibrate and evaluate
 
@@ -687,8 +773,7 @@ python eval/eval_harness.py --ckpt out/decision/decision.pth \
     --data dataset/synth --sets test_known \
     --temperature out/calibration/T.json --out out/eval/decision
 
-# The real-text run, on the public set. **No `--temperature` here**: see the note
-# below — the synthetic temperature does not transfer.
+# Historical real-text run reports raw probabilities, not a temperature-transfer test.
 python eval/eval_harness.py --ckpt out/decision/decision.pth \
     --data dataset/public --sets test_known --out out/eval/public
 
@@ -696,19 +781,18 @@ python eval/make_reliability_plot.py \
     --eval out/eval/decision/decision --sets test_known --binning equal_mass \
     --out assets
 
-# The human-disagreement figure. `--source` is required: `human_annotators` covers
-# both ChaosNLI (N≈100) and GoEmotions (N=3–5), and their noise floors differ by
-# more than an order of magnitude — averaged together the number measures the mix.
+# Select ChaosNLI to explain its task/annotation protocol separately from GoEmotions.
 python eval/make_reliability_plot.py \
     --eval out/eval/public/decision --sets test_known \
     --source public:chaosnli --binning equal_mass --out assets
 ```
 
-> **Do not apply the synthetic temperature to ChaosNLI.** The two sets have different
-> logit distributions, and `T` was fitted on the confidence distribution of
-> `test_known`-like records. The correct treatment on real text is to fit separately
-> on its own dev split, or to report the raw uncalibrated ECE. Mixing produces a
-> pretty but wrong number.
+> **Temperature transfer is an empirical question.** A synthetic-calib temperature
+> may improve or worsen real-text scores; this historical raw-probability run did not
+> test it. For in-domain calibration, fit on an independent target-domain calib/dev
+> split and freeze it before test. A labelled transfer experiment is also legitimate.
+> Scalar temperature is a simple permutation-equivariant choice for dynamic candidates,
+> not the only possible transferable parameterization and not a guarantee for new schemas.
 
 `calibrate_temperature.py` writes `T.json` containing **the SHA1 of the checkpoint and
 the tokenizer**, because temperature is bound to specific weights — a `T.json` from a
@@ -721,9 +805,10 @@ different model would otherwise be silently accepted.
 Both were hit during development, and both are the kind of failure that looks like
 something else entirely.
 
-1. **`import datasets` (pyarrow) must precede `import torch`.** Otherwise the process
-   dies silently — exit code 139, zero output, no traceback. `train_mlm.py` keeps
-   MiniMind's original `import datasets  # noqa: F401` for this reason.
+1. **Historical pyarrow/Torch import-order failure.** An earlier Windows environment
+   exited with code 139 without a traceback when the imports were reversed. The current
+   quickstart passed on the pinned environment; this is not a universal import-order rule,
+   and the current `train_mlm.py` does not contain a dummy `import datasets`.
 
 2. **There is a VRAM cliff around 7.5–8 GB where nothing crashes.** Windows WDDM pages
    to shared memory instead of raising OOM: measured, a 32×1024 batch does **not** OOM,

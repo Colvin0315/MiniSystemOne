@@ -13,20 +13,17 @@
 import hashlib
 import json
 import os
+import random
 import sys
 import time
 
+import numpy as np
 import torch
 
 
 # ---------------------------------------------------------------------------
 def get_lr(current_step, total_steps, lr):
-    """MiniMind 的余弦退火：0.1 起步、0.55 封顶。
-
-    `lr` 参数是**峰值**，实际峰值是 `0.55 * lr` —— 因为 `0.1 + 0.45*(1+cos)` 在
-    cos=1（末步）时为 0.1，在 cos=-1（半程）时为 0.55。这个不直观的缩放是
-    MiniMind 的既有约定，保留它以免和参考实现的学习率对不上。
-    """
+    """Cosine schedule from lr to 0.1 * lr over the fixed horizon."""
     import math
     return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / max(total_steps, 1))))
 
@@ -187,8 +184,10 @@ def init_model(model_cls, config, checkpoint=None, device="cuda", strict=False):
     `head_dim` 或 `intermediate_size` 写错时，缺失比例可能不到一半，于是模型带着
     一部分随机初始化安静地跑完评测。
     """
+    if checkpoint and not os.path.isfile(checkpoint):
+        raise FileNotFoundError(f"checkpoint 不存在：{checkpoint}")
     model = model_cls(config)
-    if checkpoint and os.path.exists(checkpoint):
+    if checkpoint:
         blob = torch.load(checkpoint, map_location="cpu", weights_only=True)
         info = _self_desc(blob)
         sd = blob.get("model", blob) if isinstance(blob, dict) else blob
@@ -235,26 +234,182 @@ def init_model(model_cls, config, checkpoint=None, device="cuda", strict=False):
     return model.to(device)
 
 
+RESUME_FORMAT = 2
+
+
+def seed_training(seed, device):
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise ValueError("训练必须使用可用的 CUDA；不支持 CPU fallback")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.set_device(device)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.cuda.reset_peak_memory_stats(device)
+    return device
+
+
+def validate_train_args(args):
+    for name in ("epochs", "batch_size", "accum", "max_len", "log_interval"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"--{name} 必须 > 0")
+    for name in ("max_steps", "stop_after_steps", "save_interval", "num_workers"):
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name} 必须 >= 0")
+    if (args.resume or args.save_optimizer) and args.num_workers != 0:
+        raise ValueError("精确恢复 / --save_optimizer 目前仅支持 --num_workers 0")
+    if args.resume and getattr(args, "init_checkpoint", None):
+        raise ValueError("--resume 与 --init_checkpoint 不能同时使用")
+    if args.resume and getattr(args, "encoder", None):
+        raise ValueError("--resume 与 --encoder 不能同时使用")
+
+
+def training_identity(args):
+    ignored = {"out", "log_dir", "log_interval", "save_interval", "save_optimizer",
+               "no_swanlab", "resume", "stop_after_steps", "bench_seconds", "smoke",
+               "encoder", "init_checkpoint", "tokenizer", "data", "pretrain_path",
+               "en_path"}
+    return {k: v for k, v in vars(args).items() if k not in ignored}
+
+
+def tokenizer_fingerprint(directory):
+    names = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+             "added_tokens.json", "vocab.json", "merges.txt")
+    if not os.path.isfile(os.path.join(directory, "tokenizer.json")):
+        raise FileNotFoundError(f"缺少本地 tokenizer.json：{directory}")
+    return {name: file_sha1(os.path.join(directory, name), n=40) for name in names}
+
+
+def capture_rng():
+    state = np.random.get_state()
+    return {"python": random.getstate(),
+            "numpy": {"kind": state[0], "keys": torch.tensor(state[1].astype(np.int64)),
+                      "pos": state[2], "has_gauss": state[3], "cached_gaussian": state[4]},
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all()}
+
+
+def restore_rng(state):
+    random.setstate(state["python"])
+    n = state["numpy"]
+    np.random.set_state((n["kind"], n["keys"].cpu().numpy().astype(np.uint32),
+                         n["pos"], n["has_gauss"], n["cached_gaussian"]))
+    torch.set_rng_state(state["torch_cpu"].cpu())
+    if len(state["torch_cuda"]) != torch.cuda.device_count():
+        raise ValueError("resume CUDA RNG 设备数不匹配")
+    torch.cuda.set_rng_state_all([s.cpu() for s in state["torch_cuda"]])
+
+
+def resume_state(args, fingerprints, epoch_batches, epoch=0, next_batch=0):
+    horizon = sum((n + args.accum - 1) // args.accum for n in epoch_batches)
+    if args.max_steps:
+        horizon = min(horizon, args.max_steps)
+    if not horizon or any(n <= 0 for n in epoch_batches):
+        raise ValueError("训练数据没有可用 batch")
+    return {"epoch": epoch, "next_batch": next_batch, "total_steps": horizon,
+            "epoch_batches": epoch_batches, "train_args": training_identity(args),
+            "fingerprints": fingerprints}
+
+
+def load_resume(path, config, stage, expected):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"resume 文件不存在：{path}")
+    blob = torch.load(path, map_location="cpu", weights_only=True)
+    required = {"format", "kind", "config", "meta", "model", "optimizer", "scaler",
+                "step", "epoch", "next_batch", "total_steps", "epoch_batches",
+                "train_args", "fingerprints", "rng"}
+    if (not isinstance(blob, dict) or not required.issubset(blob)
+            or blob["format"] != RESUME_FORMAT or blob["kind"] != "training_resume"):
+        raise ValueError("旧版或不完整 resume 文件；只能显式作为权重初始化，不能精确恢复")
+    if not isinstance(blob["meta"], dict) or blob["meta"].get("stage") != stage:
+        raise ValueError(f"resume stage 不匹配：需要 {stage}")
+    if blob["config"] != config.to_dict():
+        raise ValueError("resume config 不匹配")
+    for key in ("train_args", "fingerprints", "epoch_batches", "total_steps"):
+        if blob[key] != expected[key]:
+            raise ValueError(f"resume {key} 不匹配；不能更改原训练计划或数据/词表")
+    epoch, cursor, step = blob["epoch"], blob["next_batch"], blob["step"]
+    batches = expected["epoch_batches"]
+    accum = expected["train_args"]["accum"]
+    if (any(type(x) is not int for x in (epoch, cursor, step))
+            or not 0 <= epoch <= len(batches) or cursor < 0
+            or (epoch == len(batches) and cursor != 0)
+            or (epoch < len(batches) and (cursor >= batches[epoch] or cursor % accum))):
+        raise ValueError("resume cursor 不在完整 optimizer 边界")
+    completed = sum((n + accum - 1) // accum for n in batches[:epoch]) + cursor // accum
+    if step != completed or not 0 <= step <= expected["total_steps"]:
+        raise ValueError("resume step / cursor / LR horizon 不一致")
+    rng = blob["rng"]
+    if (not isinstance(rng, dict)
+            or not {"python", "numpy", "torch_cpu", "torch_cuda"}.issubset(rng)
+            or not isinstance(blob["optimizer"], dict)
+            or not {"state", "param_groups"}.issubset(blob["optimizer"])
+            or not isinstance(blob["scaler"], dict)
+            or not {"scale", "growth_factor", "backoff_factor", "growth_interval",
+                    "_growth_tracker"}.issubset(blob["scaler"])):
+        raise ValueError("不完整 resume optimizer/scaler/RNG 状态")
+    if (not isinstance(rng["numpy"], dict)
+            or not {"kind", "keys", "pos", "has_gauss", "cached_gaussian"}.issubset(rng["numpy"])
+            or not torch.is_tensor(rng["torch_cpu"])
+            or not isinstance(rng["torch_cuda"], list)
+            or len(rng["torch_cuda"]) != torch.cuda.device_count()
+            or not all(torch.is_tensor(s) for s in rng["torch_cuda"])):
+        raise ValueError("不完整或不匹配的 resume RNG 状态")
+    if blob["meta"].get("step") != step:
+        raise ValueError("resume meta.step 不一致")
+    return blob
+
+
+def restore_training(blob, model, optimizer, scaler):
+    model.load_state_dict(blob["model"], strict=True)
+    optimizer.load_state_dict(blob["optimizer"])
+    if blob["step"] > 0:
+        for name, parameter in model.named_parameters():
+            # Plain MLM never uses the structural segment embedding.
+            if blob["meta"]["stage"] == "mlm" and name == "encoder.embed_segments.weight":
+                continue
+            state = optimizer.state.get(parameter, {})
+            if not {"step", "exp_avg", "exp_avg_sq"}.issubset(state):
+                raise ValueError(f"不完整 resume Adam 状态：{name}")
+            if (not torch.is_tensor(state["step"]) or state["step"].numel() != 1
+                    or state["step"].item() != blob["step"]
+                    or any(not torch.is_tensor(state[key]) or state[key].shape != parameter.shape
+                           for key in ("exp_avg", "exp_avg_sq"))):
+                raise ValueError(f"不匹配的 resume Adam step/moment：{name}")
+    scaler.load_state_dict(blob["scaler"])
+    optimizer.zero_grad(set_to_none=True)
+    # Restore RNG only after model, optimizer, logger and loader setup.
+    return blob["rng"]
+
+
+def optimizer_update(model, optimizer, scaler):
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def write_summary(out, step, started, peak):
+    with open(os.path.join(out, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"step": step, "elapsed_s": time.perf_counter() - started,
+                   "peak_vram_gb": peak}, f, indent=2)
+
+
 def save_checkpoint(model, path, optimizer=None, scaler=None, step=0,
-                    config=None, meta=None):
-    """两件事分开写在两个文件里，因为它们用途不同。
-
-    只存半精度权重（`{name}.pth`）给推理/评测用；完整状态（含优化器动量，约 3 倍
-    大小）只在 `save_optimizer` 时另存 `{name}_opt.pth`。混在一起会让每个推理用的
-    checkpoint 都白背 3 倍体积。
-
-    **`config` / `meta` 与权重写在同一个文件里，让 checkpoint 自描述。** 没有它们，
-    下载权重的人只能回 README 手抄 `h=512 / L=8`，而且没有任何办法核对这份权重和
-    `model/tokenizer.json` 是不是配套 —— 见 `verify_tokenizer` 为什么那件事很危险。
-    两者都只占几百字节。
-
-    `meta` 里应放（都是可 JSON 化的基本类型，`weights_only=True` 才读得回来）：
-    `stage` / `tokenizer_sha1` / `gen_version` / `n_params` / `max_len` / `trained_on`。
-    step 会自动并入 `meta`。
-    """
+                    config=None, meta=None, training=None):
+    if optimizer is not None:
+        if config is None or meta is None or training is None or scaler is None:
+            raise ValueError("保存 resume 必须提供 config/meta/training/scaler")
+        if any(p.grad is not None for p in model.parameters()):
+            raise ValueError("只能在 optimizer 更新完成并清空梯度后保存 resume")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     blob = {"format": CKPT_FORMAT,
-            "model": {k: v.half() for k, v in model.state_dict().items()}}
+            "model": {k: v.detach().half() if v.is_floating_point() else v.detach()
+                      for k, v in model.state_dict().items()}}
     if config is not None:
         blob["config"] = config.to_dict()
     if meta is not None:
@@ -263,11 +418,13 @@ def save_checkpoint(model, path, optimizer=None, scaler=None, step=0,
     torch.save(blob, tmp)
     os.replace(tmp, path)
     if optimizer is not None:
-        opt_path = path.replace(".pth", "_opt.pth")
+        opt_path = os.path.splitext(path)[0] + "_opt.pth"
         tmp = opt_path + ".tmp"
-        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "scaler": scaler.state_dict() if scaler is not None else None,
-                    "step": step}, tmp)
+        torch.save({"format": RESUME_FORMAT, "kind": "training_resume",
+                    "config": config.to_dict(), "meta": dict(meta, step=step),
+                    "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(), "step": step,
+                    **training, "rng": capture_rng()}, tmp)
         os.replace(tmp, opt_path)
 
 

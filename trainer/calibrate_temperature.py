@@ -1,29 +1,5 @@
-"""
-温度校准：在 `calib` split 上拟合标量温度，写 `out/calibration/T.json`。
-
-**为什么只有一个标量温度，而不是 per-class 的偏置。** 候选集是动态的：候选 k=3
-在每条样本里都是不同的实体，"第 3 类的温度"没有指称对象。标量温度是唯一能
-(a) 跨候选集迁移、(b) 用在模型**从未见过的 schema** 上的参数化。这一点是整个
-校准故事自洽的关键，不是事后找补。
-
-**拟合 `log T` 而不是 `T`。** `T` 在 (0, ∞) 上，梯度尺度两端差几个数量级；`log T`
-在 ℝ 上均匀，LBFGS 的收敛判断才正常，而且不需要把 `T` 的参数化硬塞进 `softplus`
-（那会引入一个额外的尺度先验）。钳位在 `[0.05, 20]` 是因为更极端的温度在校准集
-（2k 条）上已经是过拟合噪声了。
-
-**三种粒度都拟合、都报告：** 全局 1 个 / per-primitive 3 个 /
-per-(primitive × K 桶) 最多 15 个。K 桶取 `eval_metrics.K_BUCKETS`，与 ECE 分桶
-共用同一套边界。三数对比比一句"per-K 温度更细"更有信息量：如果全局一个标量就能
-追平 15 个桶，那么多出来的自由度就是白算的。
-
-**绝不训练、只在 calib 上拟合。** 在校准集上训过的模型，它的温度必然过拟合，
-可靠性图会假性变好。`train_decision.py` 因此根本不读 calib。
-
-用法：
-    python trainer/calibrate_temperature.py --ckpt out/decision/decision.pth
-"""
+"""Fit temperature scaling on held-out calibration data; transfer is not guaranteed."""
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -33,30 +9,17 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer
 
 from dataset.decision_dataset import DecisionDataset
-from eval.eval_inference import collect, counts_array, effective_k
+from eval.eval_inference import collect, counts_array, effective_k, load_decision
 from eval.eval_metrics import (
     K_BUCKETS, apply_temperature, metrics_by_provenance, temp_key,
 )
-from model.model_system_one import DecisionConfig, MiniSystemOneForDecision
-from trainer.trainer_utils import init_model, unbuffer_stdout, verify_tokenizer
+from trainer.trainer_utils import file_sha1, unbuffer_stdout
 
 
-def file_sha1(path, chunk=1 << 20):
-    """按块流式哈希，不把整份权重读进内存。文件不存在时返回 None ——
-    缺失哈希本身是可报告的状态，不该让校准跑不起来。"""
-    if not path or not os.path.exists(path):
-        return None
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()[:12]
+def artifact_sha1(path):
+    return file_sha1(path, n=12)
 
 T_MIN, T_MAX = 0.05, 20.0
 
@@ -72,40 +35,22 @@ def parse_args():
     p.add_argument("--tokenizer", default="model")
     p.add_argument("--out", default="out/calibration")
     p.add_argument("--split", default="calib")
-    p.add_argument("--max_len", type=int, default=1024)
-    p.add_argument("--hidden_size", type=int, default=512)
-    p.add_argument("--num_hidden_layers", type=int, default=8)
-    p.add_argument("--crosstalk", action="store_true")
+    p.add_argument("--max_len", type=int)
+    p.add_argument("--hidden_size", type=int)
+    p.add_argument("--num_hidden_layers", type=int)
+    p.add_argument("--crosstalk", action="store_true", default=None)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--lbfgs_steps", type=int, default=200)
     return p.parse_args()
 
 
-def fit_temperature(log_p, target, mask, group, max_iter=200):
-    """在指定分组内用 LBFGS 最小化 NLL，返回 (T, nll_before, nll_after)。
-
-    参数化 `q = softmax(log_p / T)`，优化变量是 `log T`（见模块注释）。
-
-    **用 `log_p` 而不是 `p` 入参**：屏蔽槽位的 `log_p` 必须是 `-inf`，`log_softmax`
-    才把那些位置压到严格 0；若用 `p**(1/T)` 再归一化，0 要在除法里活下来，得多写
-    一层 clip。数值上更稳的那条路更好走。
-
-    **`mask` 必须真的用上，不能只是签名里的装饰。** 上游传进来的 `log_p` 是
-    `log(clip(p, 1e-30))`，屏蔽槽因此是 `-69.08` 而不是 `-inf`；它虽然在 `t=0`
-    处不贡献损失，却**会**通过 `log_softmax` 的归一化项影响其余槽位。T≈1 时
-    `exp(-69)` 可以忽略，但 T 大时不是：T=20 时 `exp(-69/20)=0.032`，几个屏蔽槽
-    就足以把归一化项抬高，把拟合往小 T 的方向拽。
-
-    屏蔽值用 `NEG_LP = -1e4` 而**不是 `-inf`**：`-inf` 的泄漏确实零，但 `log_temp`
-    的梯度里会出现 `0 · (-lp/T²)` = `0 · ∞` = NaN，LBFGS 一步就把 T 变成 NaN。
-    `-1e4` 在 float64 下 `exp(-1e4/T)` 对任何 T≥0.05 都下溢到严格的 0，泄漏同样是
-    零，而梯度保持有限。
-    """
-    lp = torch.tensor(log_p, dtype=torch.float64)
-    t = torch.tensor(target, dtype=torch.float64)
-    sel = torch.tensor(group, dtype=torch.bool)
-    lp = lp.masked_fill(~torch.tensor(np.asarray(mask), dtype=torch.bool), NEG_LP)
+def fit_temperature(log_p, target, mask, group, max_iter=200, device="cuda"):
+    """Fit masked NLL on one calibration group."""
+    lp = torch.tensor(log_p, dtype=torch.float64, device=device)
+    t = torch.tensor(target, dtype=torch.float64, device=device)
+    sel = torch.tensor(group, dtype=torch.bool, device=device)
+    lp = lp.masked_fill(~torch.tensor(np.asarray(mask), dtype=torch.bool, device=device), NEG_LP)
     lp, t = lp[sel], t[sel]
     if lp.numel() == 0:
         return None
@@ -115,8 +60,8 @@ def fit_temperature(log_p, target, mask, group, max_iter=200):
         # 屏蔽槽上 `t=0` 且 `ls=-inf`，直接相乘得到 NaN。先把 `t=0` 处换成 0 再乘。
         return -(t * torch.where(t > 0, ls, torch.zeros_like(ls))).sum(-1).mean()
 
-    before = float(objective(torch.zeros((), dtype=torch.float64)))
-    log_temp = torch.zeros((), dtype=torch.float64, requires_grad=True)
+    before = float(objective(torch.zeros((), dtype=torch.float64, device=device)))
+    log_temp = torch.zeros((), dtype=torch.float64, device=device, requires_grad=True)
     opt = torch.optim.LBFGS([log_temp], lr=1.0, max_iter=max_iter,
                             line_search_fn="strong_wolfe")
 
@@ -128,7 +73,7 @@ def fit_temperature(log_p, target, mask, group, max_iter=200):
 
     opt.step(closure)
     temp = float(torch.exp(log_temp).clamp(T_MIN, T_MAX))
-    after = float(objective(torch.tensor(np.log(temp), dtype=torch.float64)))
+    after = float(objective(torch.tensor(np.log(temp), dtype=torch.float64, device=device)))
     return temp, before, after
 
 
@@ -140,25 +85,26 @@ def main():
     if device == "cpu":
         raise SystemExit("本项目的所有实测数字都基于 GPU；--device cpu 不在支持范围内。")
 
-    tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    # 同 eval_harness：词表不配套时温度会拟合到一份错的 p 上，且不会报错。
-    verify_tokenizer(args.ckpt, args.tokenizer)
-    config = DecisionConfig(
-        hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-        vocab_size=len(tok), candidate_crosstalk=args.crosstalk,
-        pad_token_id=tok.convert_tokens_to_ids("<pad>"),
-        sep_token_id=tok.convert_tokens_to_ids("<sep>"),
+    tok, model, meta = load_decision(
+        args.ckpt, args.tokenizer, device, hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers, candidate_crosstalk=args.crosstalk,
     )
-    model = init_model(MiniSystemOneForDecision, config, args.ckpt, device)
+    args.max_len = args.max_len or meta.get("max_len", 1024)
 
+    if args.split != "calib":
+        raise SystemExit("温度只允许在 calib split 上拟合，不可用 val/test 替代。")
     path = os.path.join(args.data, f"{args.split}.jsonl")
     if not os.path.exists(path):
         raise SystemExit(f"缺少 {path} —— 校准必须在一份**没有参与训练**的 split 上做")
     ds = DecisionDataset(path, tok, max_len=args.max_len, augment_k=False)
+    if any(rec.get("split") != "calib" for rec in ds.records):
+        raise SystemExit("calib 文件中包含其他 split 的样本")
 
     print("\n========== 收 calib 上的逐样本分布 ==========")
     t0 = time.time()
     col = collect(model, ds, device, args.batch_size, args.limit)
+    if col is None:
+        raise SystemExit("calib 数据为空，无法拟合温度")
     k = effective_k(col["mask"])
     n = col["n"]
     print(f"  {n} 条，K_used {k.min()}–{k.max()}，{time.time()-t0:.0f} 秒")
@@ -213,13 +159,13 @@ def main():
                                   levels=np.where(col["levels"] >= 0, col["levels"], 0),
                                   counts=counts_array(col))
         self_report[gran] = m
-        print(f"  {gran:12s} ECE {m['all']['ece']:.4f}  Brier {m['all']['brier']:.4f}  "
+        print(f"  {gran:12s} ECE {m['all']['ece']:.4f}  distribution_l2 {m['all']['distribution_l2']:.4f}  "
               f"NLL {m['all']['nll']:.4f}")
     raw = metrics_by_provenance(col["p"], target, mask, provenance=col["provenance"],
                                 is_ord=col["is_ord"],
                                 levels=np.where(col["levels"] >= 0, col["levels"], 0),
                                 counts=counts_array(col))
-    print(f"  {'未校准':12s} ECE {raw['all']['ece']:.4f}  Brier {raw['all']['brier']:.4f}  "
+    print(f"  {'未校准':12s} ECE {raw['all']['ece']:.4f}  distribution_l2 {raw['all']['distribution_l2']:.4f}  "
           f"NLL {raw['all']['nll']:.4f}")
 
     os.makedirs(args.out, exist_ok=True)
@@ -230,8 +176,8 @@ def main():
         # checkpoint 或重训 tokenizer 后，旧的 T.json 就静默失效了，而它会照常
         # 被 `eval_harness.py --temperature` 吃进去并产出一张看起来正常的可靠性图。
         # 把两个哈希写进来，读者才能判断一个 T.json 是否适用于手上的模型。
-        "ckpt_sha1": file_sha1(args.ckpt),
-        "tokenizer_sha1": file_sha1(os.path.join(args.tokenizer, "tokenizer.json")),
+        "ckpt_sha1": artifact_sha1(args.ckpt),
+        "tokenizer_sha1": artifact_sha1(os.path.join(args.tokenizer, "tokenizer.json")),
         "tokenizer_path": os.path.abspath(args.tokenizer),
         "split": args.split, "n": n,
         "k_buckets": [list(b) for b in K_BUCKETS],

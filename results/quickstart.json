@@ -1,0 +1,61 @@
+{
+  "scope": "Offline synthetic-template smoke run, not full pretraining or business-quality evidence",
+  "started_at": "2026-09-20T05:54:00.564004+00:00",
+  "base_revision": "ac5a0eea841552d581f2ed82751515cff0ec989f",
+  "working_tree_dirty": true,
+  "version_note": "Measured on this uncommitted implementation, not on the unmodified base revision. Documentation and validation tests continued changing afterward.",
+  "command": "python scripts/quickstart.py",
+  "config_path": "configs/quickstart.json",
+  "config": {
+    "seed": 0, "hidden_size": 128, "num_hidden_layers": 2,
+    "batch_size": 4, "accum": 1, "num_workers": 0, "precision": "bf16 training, fp32 evaluation",
+    "mlm_max_len": 256, "decision_max_len": 2048,
+    "mlm_max_steps": 20, "decision_max_steps": 20,
+    "tokenizer_n_synth": 2000, "mlm_n_synth": 2000,
+    "per_gen_train": 64, "per_gen_val": 16, "per_gen_calib": 16,
+    "per_gen_test_known": 16, "per_gen_test_ood": 0,
+    "warmup_steps": 2, "epochs": 8, "lbfgs_steps": 20
+  },
+  "environment": {
+    "python": "3.12.13", "torch": "2.6.0+cu124", "transformers": "4.57.6",
+    "tokenizers": "0.22.2", "numpy": "2.5.3", "datasets": "3.6.0",
+    "cuda": "12.4", "os": "Windows 11 10.0.26200",
+    "gpu": "NVIDIA GeForce RTX 4070 Laptop GPU", "vram_mib": 8188,
+    "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"
+  },
+  "elapsed_s": 90.50610990001587,
+  "stage_elapsed_s": {
+    "tokenizer": 8.871920599951409, "data": 12.345378800004255,
+    "mlm": 11.26589999999851, "decision": 10.57777500001248,
+    "calibration": 9.637727499997709, "eval": 9.90819529996952,
+    "inference_noul": 9.654035400017165, "inference_choice": 9.196783300023526,
+    "inference_score": 9.000248899974395
+  },
+  "peak_training_allocated_gb": {"mlm": 0.096705536, "decision": 0.209728},
+  "memory_note": "torch.cuda.max_memory_allocated / 1e9; excludes CUDA context, allocator reservation and other processes. Not a whole-device VRAM requirement or an all-GPU support claim.",
+  "test_known": {
+    "n": 96,
+    "raw": {
+      "accuracy": 0.2916666666666667, "accuracy_soft": 0.29433270040884335,
+      "nll": 1.600826684218405, "distribution_l2": 0.25853338806340537,
+      "expected_brier": 0.7263561051286419, "ece": 0.06995464949463924
+    },
+    "global_temperature": {
+      "accuracy": 0.2916666666666667, "nll": 1.6005426876284297,
+      "distribution_l2": 0.2583631911526727, "expected_brier": 0.7261859082179093,
+      "ece": 0.07013697901985536
+    },
+    "ece_binning": "equal_mass", "ece_bins": 15,
+    "note": "Temperature fitted on separate calib; global ECE slightly increased on test. Small ECE does not imply accurate decisions. No quality target was used to tune this smoke run."
+  },
+  "artifact_sha256": {
+    "tokenizer/tokenizer.json": "6be04740f19ccd9c9cb21c7c941d9bac6800e24b95e273084719be77bfe6a5cf",
+    "mlm/mlm.pth": "06e20c50cbf8ce57d59e5500dd7a1a311b3365bd25a67727573dec4f1c9bffef",
+    "decision/decision.pth": "d4b095bc06390581337db50f9c73dce98db0dff81b3ddabbdb89da63ab963e5a",
+    "calibration/T.json": "cc39bbb59d1627ba70c48dd206c912538f04b4542082c492b6a13f67738e5035",
+    "data/train.jsonl": "d88b59965c6ab3e8acda47747578cb9531426e84b7f39fa0e59718a1350db462",
+    "data/val.jsonl": "c7a7a09773073385444b135de2d04f18b6827019d1197a3fa60de93887519287",
+    "data/calib.jsonl": "ccd05f7a2c8660f7848ac8bacb6cf7275d641e8d89b048027199865e56baee43",
+    "data/test_known.jsonl": "0b4c35ad454b20095b8d10d55f3b2e5b20ae73921b80aade1cbbbf1ffa5b4db8"
+  }
+}
