@@ -1,0 +1,10 @@
+{
+  "schema": {"primitive": "score", "name": "trace_demo"},
+  "state": "任务要求查询订单。助手调用了订单查询工具，核对了订单号，并准确回复查询结果。",
+  "question": "任务完成质量是什么等级？",
+  "candidates": [
+    {"label": "poor", "text": "等级1：未完成", "meta": {"level": 1}},
+    {"label": "partial", "text": "等级2：部分完成", "meta": {"level": 2}},
+    {"label": "complete", "text": "等级3：完整完成", "meta": {"level": 3}}
+  ]
+}

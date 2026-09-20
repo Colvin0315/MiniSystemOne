@@ -27,6 +27,7 @@ dataset/public/*.jsonl
 # `pretrain_en*`** —— 只写 `pretrain_en.jsonl` 时两个来源件不被覆盖，
 # `git add .` 会把 61 MB 语料一起推上去。
 dataset/pretrain_en*.jsonl
+dataset/pretrain_zh.jsonl
 dataset/corpus_*.txt
 
 # ---- 分词器实验目录 ----

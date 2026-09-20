@@ -422,7 +422,8 @@ class MiniSystemOneForDecision(PreTrainedModel):
     def forward(self, input_ids, seg_id=None, cand_id=None, cand_span=None, cand_mask=None,
                 prefix_mask=None, attention_mask=None, position_ids=None,
                 past_key_values=None, use_cache=False,
-                target=None, is_ord=None, lambda_brier=0.5, lambda_ord=0.5, **kwargs):
+                target=None, is_ord=None, lambda_brier=0.5, lambda_ord=0.5,
+                brier_normalize=False, **kwargs):
         if seg_id is not None:
             # mask 与 prefix_mask 一律从 seg_id / cand_id 推出，不要求调用方传。
             # 除了省一次 (B,1,S,S) 的搬运，更重要的是**漏传时不会静默退化成全连通
@@ -447,7 +448,8 @@ class MiniSystemOneForDecision(PreTrainedModel):
         loss, loss_dict = None, {}
         if target is not None:
             loss, loss_dict = self.compute_loss(logits, target, cand_mask, is_ord,
-                                                lambda_brier, lambda_ord)
+                                                lambda_brier, lambda_ord,
+                                                brier_normalize=brier_normalize)
         return DecisionOutput(
             loss=loss, logits=logits, z=z, hidden_states=hidden,
             past_key_values=presents, loss_dict=loss_dict,

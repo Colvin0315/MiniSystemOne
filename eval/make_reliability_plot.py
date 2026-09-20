@@ -9,19 +9,13 @@
 分桶。图上的曲线和标题里的 ECE 必须来自同一份代码，否则会出现"图看着挺直、ECE
 却不小"这种谁也解释不了的组合 —— 那正是这类图最容易骗人的地方。
 
-四联图的取舍：
-  (a)(b) 校准前/后可靠性图 —— 项目主张的核心。带**二项误差棒**：桶均值是有限样本
-         均值，`√(c(1-c)/n_b)` 是它自身的抽样噪声。没有这两根棒，"ECE=0.01" 读不出
-         是"校准得好"还是"评测集太小"。
-  (c)    置信度直方图（对数纵轴）—— **默认 equal-mass 分桶的理由就在这张图上**：
-         小模型把大量样本堆在高置信度尾部，等宽分桶会把尾部并成少数几个大桶，
-         误差被平摊，ECE 显得比实际好。
-  (d)    per-provenance ECE 前后对比 —— 各来源的不可约噪声底不同，混一个数字算
-         ECE 没有意义（见 `eval_metrics` 的模块注释）。
+四联图：校准前/后可靠性曲线、置信度分布、per-provenance ECE。
+每桶标出样本数；不把软正确率当作独立 Bernoulli 样本画通用置信区间。
+默认展示 soft_targets 是展示选择，硬标签也可用 --include_hard 计算校准。
+标注 MC 参考量只描述假设模型，不从 ECE 中扣除；混合总体须说明来源组成。
 
-**风险-覆盖率曲线不在这里**：它需要弃权监督（G4 security_gate）与一套按置信度
-弃权的评测，数据需求与可靠性图不同。本项目目前**没有产出**这条曲线 —— 不要
-把这里的图读成它。
+**风险-覆盖率曲线不在这里**：自定义任务教程单独使用 `risk_coverage_curve`，
+验证冻结的置信度/人工接管策略。不要把这里的可靠性图读成该曲线。
 
 用法：
     python eval/make_reliability_plot.py --eval out/eval/decision --sets test_known
@@ -38,11 +32,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import numpy as np
 
 from eval.eval_metrics import (
-    CALIBRATION_PROVENANCE, binomial_noise_floor, ece, reliability_curve, top1,
+    SOFT_TARGET_PROVENANCE, ece_annotation_reference, ece, reliability_curve, top1,
 )
-
-# 二项误差棒的置信水平。1.96σ ≈ 95%。
-Z = 1.96
 
 
 CJK_FONTS = ("Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", "SimHei",
@@ -60,12 +51,9 @@ def parse_args():
     p.add_argument("--binning", default="equal_mass",
                    choices=("equal_mass", "equal_width"))
     p.add_argument("--include_hard", action="store_true",
-                   help="把 hard 也画进来（默认剔除；见 eval_metrics 模块注释）")
+                   help="默认仅展示 soft_targets；此选项也展示合法的 hard 校准指标")
     p.add_argument("--source", nargs="*", default=None,
-                   help="只画这些 source（如 chaosnli / goemotions）。"
-                        "**这两个必须分开看**：ChaosNLI 是 N≈100 人的标注分布，"
-                        "GoEmotions 只有 N=3–5，把它们的 ECE 合成一根柱子的那个数"
-                        "度量的是混合比例，不是校准（见 docs/CALIBRATION.md §1）。")
+                   help="只画指定 source；分来源便于解释，混合总体须说明组成")
     p.add_argument("--dpi", type=int, default=150)
     return p.parse_args()
 
@@ -120,32 +108,25 @@ def load_set(path, include_hard, sources=None):
     mask = np.arange(p.shape[1])[None, :] < k_used[:, None]
     prov = np.asarray(ps["provenance"])
     sel = (np.ones(len(prov), bool) if include_hard
-           else np.isin(prov, CALIBRATION_PROVENANCE))
+           else np.isin(prov, SOFT_TARGET_PROVENANCE))
     if sources:
         # source 与 provenance 是**两回事**：provenance 说"这份目标是怎么来的"
         # （human_annotators），source 说"是哪一批数据"（chaosnli / goemotions）。
-        # ChaosNLI 与 GoEmotions 是同一个 provenance、完全不同的噪声底。
+        # ChaosNLI 与 GoEmotions 的任务和标注协议不同，分来源便于解释。
         sel &= np.isin(np.asarray(ps["source"]), list(sources))
     return obj, {"raw": (p, t, mask), "cal": (p_cal, t, mask)}, prov, sel
 
 
-def panel_reliability(ax, p, t, mask, bins, binning, title, floor=None):
+def panel_reliability(ax, p, t, mask, bins, binning, title, annotation_reference=None,
+                      annotation_n=0):
     """一张可靠性图。桶、曲线、ECE **全部来自 eval_metrics**。"""
     e = ece(p, t, mask, bins, binning)
     cb, rb, nb = reliability_curve(p, t, mask, bins, binning)
 
     ax.plot([0, 1], [0, 1], "--", color="0.55", lw=1.2, zorder=1, label="完美校准")
     if len(nb):
-        # 理想线的二项带，用**中位桶样本数**。逐桶的误差棒才是该看的；这条带
-        # 只回答"在当前的评测规模下，多直才算真的直"。
-        n_ref = float(np.median(nb))
-        g = np.linspace(0.001, 0.999, 200)
-        half = Z * np.sqrt(g * (1 - g) / max(n_ref, 1))
-        ax.fill_between(g, g - half, g + half, color="0.85", zorder=0,
-                        label=f"二项 95% 带（n≈{int(n_ref)}/桶）")
-        yerr = Z * np.sqrt(np.clip(rb * (1 - rb), 0, None) / np.maximum(nb, 1))
-        ax.errorbar(cb, rb, yerr=yerr, fmt="o-", color="#1f5fa8", ms=4, lw=1.4,
-                    capsize=2.5, zorder=2, label="实测")
+        ax.plot(cb, rb, "o-", color="#1f5fa8", ms=4, lw=1.4,
+                zorder=2, label="实测（无置信区间）")
         for x, y, n in zip(cb, rb, nb):
             ax.annotate(f"{n}", (x, y), textcoords="offset points", xytext=(0, 7),
                         ha="center", fontsize=6.5, color="0.35")
@@ -153,9 +134,9 @@ def panel_reliability(ax, p, t, mask, bins, binning, title, floor=None):
     ax.set_xlabel(f"平均置信度（{binning}，{bins} 桶）")
     ax.set_ylabel("平均正确率（软口径 t[argmax p]）")
     sub = f"ECE = {e:.4f}"
-    if floor:
-        sub += (f"\n标注噪声地板 ≈ {floor:.4f}  →  校正后 "
-                f"{max(0.0, e - floor):.4f}")
+    if annotation_reference is not None:
+        sub += (f"\n标注 MC 参考 = {annotation_reference:.4f}（n={annotation_n}）"
+                "\n假设模型诊断，非下界，不扣除")
     ax.set_title(f"{title}\nn={int(nb.sum()) if len(nb) else 0}   {sub}", fontsize=10)
     ax.legend(loc="upper left", fontsize=7, framealpha=0.9)
     ax.grid(alpha=0.25, lw=0.5)
@@ -173,14 +154,14 @@ def panel_hist(ax, conf_raw, conf_cal, bins):
     ax.set_ylabel("样本数（对数）")
     ax.set_title(f"置信度分布（{bins} 个 equal-mass 桶 → 每桶约 "
                  f"{max(1, len(conf_raw)//bins)} 条）\n"
-                 f"尾部越尖，等宽分桶越会把误差平摊掉：这就是默认 equal-mass 的理由",
+                 f"分位数边界遇到并列时实际桶数可能减少；分桶方式影响 ECE",
                  fontsize=10)
     ax.legend(fontsize=8)
     ax.grid(alpha=0.25, lw=0.5)
 
 
 def panel_by_provenance(ax, prov, packs_raw, packs_cal, bins, binning):
-    """per-provenance ECE 前后对比。各来源不可约噪声底不同，所以要分开看。"""
+    """per-provenance ECE 前后对比；显示来源组成而非否定混合总体。"""
     groups = sorted(set(prov.tolist()))
 
     def per_group(packs):
@@ -200,7 +181,7 @@ def panel_by_provenance(ax, prov, packs_raw, packs_cal, bins, binning):
     ax.set_xticklabels(groups, fontsize=8, rotation=15, ha="right")
     ax.set_ylabel("ECE")
     ax.set_title("各 provenance 的 ECE（校准前 / 后）\n"
-                 "来源不同的不可约噪声底不同，所以不合成一个数", fontsize=10)
+                 "分来源解释；混合总体须说明组成", fontsize=10)
     ax.legend(fontsize=8)
     ax.grid(alpha=0.25, lw=0.5, axis="y")
 
@@ -215,30 +196,20 @@ def make_set(plt, obj, packs, prov, sel, args, out_dir, name):
     conf_raw = top1(packs_raw[0], packs_raw[2])[1]
     conf_cal = top1(packs_cal[0], packs_cal[2])[1]
 
-    # 噪声地板按**选中的这批样本**重算，不直接读 `metrics.all` 里那个。两个理由：
-    # `all` 混了全部 provenance（而各来源的噪声底不同）；且默认剔 hard、`--source`
-    # 过滤之后样本集已经变小 —— 而地板随每桶样本数变化（桶内噪声按 1/√n_b 衰减），
-    # 把混合集的地板扣到单一来源的 ECE 上，得到的"校正后"数字是错的。
-    # 这也正是 ChaosNLI 那张图必须单看的原因：474 条分 15 桶后每桶约 32 条，
-    # 地板比在 2 万条上大得多，正是它让 ECE 可解读。
-    floor = None
+    # 参考量只在有正标注数的子集计算，缺失值不是零正确率。
+    annotation_reference, annotation_n = None, 0
     raw_counts = obj["per_sample"].get("counts") or []
     if len(raw_counts) == len(sel):
-        # **先按 sel 取子集，再判有没有 counts。** 顺序反过来就永远算不出地板：
-        # `counts` 整列里混着 hard（`counts=None`），`all(c is not None ...)` 因此
-        # 恒为 False —— 哪怕选中的 474 条 ChaosNLI 人人是 counts=100。症状是图题上
-        # "标注噪声地板 → 校正后"那一行**静默消失**，而那行正是
-        # `docs/CALIBRATION.md` §6 称为"严谨与幼稚报告分界线"的东西。
-        counts = np.asarray([np.nan if c is None else c for c in raw_counts],
-                            dtype=np.float64)[sel]
-        if counts.size and np.isfinite(counts).all() and counts.max() > 0:
-            floor = binomial_noise_floor(packs_raw[0], counts, packs_raw[2],
-                                         args.bins, args.binning)
+        counts = np.asarray(raw_counts, dtype=np.float64)[sel]
+        annotation_n = int((np.isfinite(counts) & (counts > 0)).sum())
+        annotation_reference = ece_annotation_reference(
+            packs_raw[0], counts, packs_raw[2], args.bins, args.binning)
     gran = obj["per_sample"].get("temperature_applied")
 
     fig, axes = plt.subplots(2, 2, figsize=(12.5, 10.5))
     e0 = panel_reliability(axes[0, 0], *packs_raw, args.bins, args.binning,
-                           "校准前", floor=floor)
+                           "校准前", annotation_reference=annotation_reference,
+                           annotation_n=annotation_n)
     # `temperature_applied` 为 None 表示**这一次评测根本没给 `--temperature`**，
     # 此时 `p_calibrated` 就是 `p`，右图与左图逐点相同。标题必须说出来，否则
     # 读者会把"两条一模一样的曲线"读成"温度校准毫无效果"，而真相是它没被运行过。
@@ -248,15 +219,15 @@ def make_set(plt, obj, packs, prov, sel, args, out_dir, name):
     panel_hist(axes[1, 0], conf_raw, conf_cal, args.bins)
     panel_by_provenance(axes[1, 1], prov, packs_raw, packs_cal, args.bins, args.binning)
 
-    n_hard = int((~sel).sum())
+    n_excluded = int((~sel).sum())
     note = (f"来源：{os.path.basename(obj['env']['ckpt'])}  sha1 "
             f"{obj['env']['ckpt_sha1']}   split={obj['set']}  "
             f"bins={args.bins}/{args.binning}  "
             f"gen_version={','.join(obj.get('gen_version') or ['-'])}")
     if args.source:
         note += f"   source={','.join(args.source)}"
-    if n_hard:
-        note += f"   （已剔除 {n_hard} 条 hard，--include_hard 可放开）"
+    if n_excluded:
+        note += f"   （provenance/source 筛选排除 {n_excluded} 条）"
     fig.suptitle(f"MiniSystemOne — {obj['set']} 可靠性图\n{note}", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     path = os.path.join(out_dir, f"reliability_{name}.png")

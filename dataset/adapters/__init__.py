@@ -75,12 +75,7 @@ def sample_k(rng, n_avail):
 
 
 def _audit_of(item):
-    """合并两处 audit。合成侧把 audit 放在 `target["audit"]` 里（`base._one` 用
-    `dict(item["target"], p=p)` 整体搬运，所以它原样存活）；适配器也是同样的写法。
-    但 `finish()` 是从零重建 target 的，**不显式搬运就会把它丢掉** —— 而丢掉的恰是
-    `n_annotators` 这类审计量，它们不参与训练，所以丢了不报错，只是
-    `binomial_noise_floor` 从此算不出来，噪声校正的 ECE 悄悄变成不可能。
-    """
+    """Preserve audit metadata while reconstructing targets."""
     out = dict(item["target"].get("audit") or {})
     out.update(item.get("audit") or {})
     return out
@@ -117,11 +112,7 @@ def finish(adapter, index, split, item, template_id, entity_pool):
     state = "\n".join(s["text"] for s in sections)
     target = {"kind": "soft", "p": p, "provenance": item["provenance"],
               "renormalized": False, "audit": _audit_of(item)}
-    # `counts`（标注者人数）**必须在这里显式透传**，和 `p` / `provenance` 一样。
-    # 只写进 `audit.n_annotators` 是不够的：`binomial_noise_floor` 读的是
-    # `target["counts"]`（经 `DecisionDataset` → `per_sample.counts`），
-    # 而 `audit` 是给人看的、不进任何计算。值保住了但键不对，症状就只是报告里
-    # "噪声校正后 ECE"那一行静默消失 —— 不报错、不留痕。
+    # Metrics read counts from target, not from human-readable audit metadata.
     if item["target"].get("counts") is not None:
         target["counts"] = int(item["target"]["counts"])
     rec = {

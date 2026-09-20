@@ -1,0 +1,6 @@
+{
+  "schema": {"primitive": "noul", "name": "refund_demo", "positive_label": "yes"},
+  "state": "退款规则：购买后七天内且商品未使用可退款。此订单购买于三天前，商品未使用。",
+  "question": "是否符合退款条件？",
+  "candidates": [{"label": "no", "text": "<no>"}, {"label": "yes", "text": "<yes>"}]
+}

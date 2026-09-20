@@ -1,0 +1,10 @@
+{
+  "schema": {"primitive": "choice", "name": "tool_demo"},
+  "state": "用户想查询订单的物流进度。",
+  "question": "应该选择哪个工具？",
+  "candidates": [
+    {"label": "track", "text": "查询订单物流"},
+    {"label": "refund", "text": "申请退款"},
+    {"label": "human", "text": "转人工客服"}
+  ]
+}

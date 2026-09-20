@@ -1,0 +1,18 @@
+{
+  "scope": "Customer routing tutorial smoke run; no deployed tools or business-quality claim",
+  "base_revision": "ac5a0eea841552d581f2ed82751515cff0ec989f",
+  "working_tree_dirty": true,
+  "seed": 0,
+  "encoder": "out/quickstart/mlm/mlm.pth (20-update synthetic-only MLM)",
+  "training": {"hidden_size": 128, "num_hidden_layers": 2, "batch_size": 4, "accum": 1, "max_len": 512, "max_steps": 100, "epochs": 10, "warmup_steps": 2, "k_min": 4, "k_max": 4, "num_workers": 0, "device": "cuda", "precision": "bf16"},
+  "split_counts": {"train": 128, "val": 32, "calib": 32, "test_known": 32},
+  "temperature": {"fit_split": "calib", "applied_granularity": "global"},
+  "policy": {"selection_split": "val", "max_empirical_risk": 0.1, "threshold": null, "meaning": "No positive-coverage validation threshold met the empirical constraint; hand off every request."},
+  "validation": {"accuracy": 0.5, "nll": 1.5573970322467319, "distribution_l2": 0.8633928109202083, "expected_brier": 0.8633928109202084, "ece": 0.45853829664105916, "coverage": 0.0, "accepted_risk": null, "handoff_fraction": 1.0},
+  "test_known": {"n": 32, "accuracy": 0.65625, "nll": 1.1118162601089288, "distribution_l2": 0.5843872747956769, "expected_brier": 0.5843872747956769, "ece": 0.44252651978735336, "accepted": 0, "model_human": 5, "threshold_handoff": 27, "coverage": 0.0, "accepted_risk": null, "handoff_fraction": 1.0},
+  "dispatch_examples": {
+    "order_query": {"selected_label": "order", "confidence": 0.6899397485869166, "dispatched_to": "human"},
+    "untrained_customs_tax_request": {"selected_label": "human", "confidence": 0.25616743252506696, "dispatched_to": "human", "note": "Manually marked unseen; this single handoff does not establish OOD detection."}
+  },
+  "interpretation": "This run demonstrates independent calibration and policy selection, including the valid zero-coverage outcome. Test labels were not used to retune the threshold. No real refund, account change, network request or human ticket was executed."
+}

@@ -55,7 +55,7 @@
 | `target.p` | 长度 = `len(candidates)`，**和为 1**。若是子采样后的目标，须重新归一化 |
 | `target.provenance` | `explicit_rng` / `marginalized` / `tie_set` / `human_annotators` / `hard` |
 | `target.renormalized` | 候选被 K 子采样后目标重新归一化过则为 `true` |
-| `target.counts` | **标注者人数**（标量，逐样本）。仅 `human_annotators` 有；合成集的 `P*` 是精确值，所以没有这个字段、地板本就是 0。它是 `binomial_noise_floor` 的**唯一**输入 —— 不写它，报告里"噪声校正后 ECE"那一行会静默消失 |
+| `target.counts` | 可选的逐样本标注者人数（正整数），用于 `ece_annotation_reference` 假设标注模型诊断；缺失/零值不参与该诊断，不能理解为零正确率或零噪声下界 |
 | `target.audit` | 生成器内部量（`margin`、`q_raw`、`tau`、隐藏 `h`…）。供 oracle 上界与特征充分性测试，**不进模型** |
 | `meta.K_full` | 候选超集大小。评测用全集，训练子采样 |
 | `meta.template_id` | 模板标识。**split 按 template_id × entity_pool 划分**，绝不随机逐条划分 |
@@ -64,8 +64,10 @@
 
 ## provenance 与指标的关系
 
-`target.provenance` 决定该样本**进入哪些指标**。混在一起算 ECE 没有意义，因为各来源的
-不可约噪声底不同。
+`target.provenance` 说明目标构造来源，用于分组解释，不决定校准资格。
+硬标签 CE/观测 Brier 是 proper scores，硬标签也能计算 ECE。混合总体合法但须说明组成。
+新输出使用 `all`、各 provenance、必要时的 `soft_targets` 聚合（旧名 `calibration`）。
+`distribution_l2` 替代旧指标 `brier`，新增 `expected_brier`，详见 [CALIBRATION.md](CALIBRATION.md)。
 
 | provenance | 含义 | 来源 | 校准指标 |
 |---|---|---|---|
@@ -73,7 +75,7 @@
 | `marginalized` | 目标是隐藏变量的边缘化 | 合成 | ✅ |
 | `tie_set` | 状态不决定唯一答案，目标是有效集上的均匀分布 | 合成 | ✅ |
 | `human_annotators` | 真实人类标注分歧分布 | ChaosNLI / GoEmotions | ✅ |
-| `hard` | 硬标签 | CLINC150 / banking77 / Amazon | ❌ **排除在所有校准指标之外** |
+| `hard` | 观测硬标签 | CLINC150 / banking77 / Amazon | 可计算 |
 
 ## 三条硬性约束（由 audit 脚本强制）
 

@@ -5,8 +5,7 @@ Amazon Reviews (en) —— 唯一的**真实语料上的序数评分**任务。
 真人在真评论上的一到五星，所以它是 `ordinal_mae` 与 `expected_score` 两个指标上
 "合成规则能不能迁移到真实文本"的直接证据。
 
-**provenance = `hard`**：一位评价者一个星，没有可报告的 P*。它进准确率与序数表，
-**排除在所有校准指标之外**（见 `docs/DATA_SCHEMA.md`）。
+**provenance = `hard`**：单次星级不揭示逐条 P*，但支持观测 Brier、NLL 与分桶 ECE。
 
 两处与合成侧刻意对齐的地方：
 

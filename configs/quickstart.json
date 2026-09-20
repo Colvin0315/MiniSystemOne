@@ -1,0 +1,22 @@
+{
+  "seed": 0,
+  "hidden_size": 128,
+  "num_hidden_layers": 2,
+  "batch_size": 4,
+  "num_workers": 0,
+  "precision": "bf16",
+  "warmup_steps": 2,
+  "epochs": 8,
+  "mlm_max_len": 256,
+  "decision_max_len": 2048,
+  "mlm_max_steps": 20,
+  "decision_max_steps": 20,
+  "tokenizer_n_synth": 2000,
+  "mlm_n_synth": 2000,
+  "per_gen_train": 64,
+  "per_gen_val": 16,
+  "per_gen_calib": 16,
+  "per_gen_test_known": 16,
+  "per_gen_test_ood": 0,
+  "lbfgs_steps": 20
+}

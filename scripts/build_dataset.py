@@ -175,10 +175,7 @@ def build_public(args):
         for f in files.values():
             f.close()
 
-    # **契约门禁：`human_annotators` 必须有 `counts`，其余必须没有。**
-    # 这个字段是 `binomial_noise_floor` 的唯一输入，而它一旦缺失，症状只是报告里
-    # "噪声校正后 ECE"那一行静默消失 —— 不报错、不留痕，且很容易被误读成
-    # "这个模型没有噪声底"。所以在这里硬拦，而不是靠散文提醒。
+    # Annotation counts are required to interpret the human-frequency targets.
     bad = [(p, h) for (p, h) in by_counts if (p == "human_annotators") != h]
     if bad:
         raise SystemExit(
